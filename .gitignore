@@ -1,0 +1,43 @@
+# Environment
+.env
+venv/
+env/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Models (too large for git)
+models/*.pth
+models/*.pt
+models/*.weights
+
+# Data
+data/videos/
+data/images/
+*.mp4
+*.avi
+*.jpg
+*.png
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Output
+output/
+results/

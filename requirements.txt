@@ -1,0 +1,24 @@
+# Core dependencies
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+opencv-python>=4.8.0
+Pillow>=10.0.0
+
+# Modern AI Libraries
+ultralytics>=8.1.0      # YOLOv8/v9/v10/v11
+mediapipe>=0.10.11      # Google MediaPipe
+scipy>=1.11.0
+
+# Cloud & Storage
+supabase>=2.4.0
+python-dotenv>=1.0.1
+
+# Modern GUI
+customtkinter>=5.2.0
+darkdetect>=0.8.0
+
+# Utilities
+tqdm>=4.66.0
+matplotlib>=3.8.0
+scikit-image>=0.22.0
