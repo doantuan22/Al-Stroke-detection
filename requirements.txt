@@ -13,6 +13,7 @@ scipy>=1.11.0
 # Cloud & Storage
 supabase>=2.4.0
 python-dotenv>=1.0.1
+requests>=2.31.0
 
 # Modern GUI
 customtkinter>=5.2.0
