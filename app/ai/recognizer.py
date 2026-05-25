@@ -1,117 +1,187 @@
 """
-Stroke and Fall Recognizer (COCO Format Optimized)
-Logic-based detection for 17-point skeletons — v2 (Reduced False Positives)
+Stroke and Fall Recognizer  — v5 (Production-Ready)
+==========================================================
+3 detectors doc lap:
+
+  1. Sudden Fall     : Max hip velocity trong cua so (khong chi last frame)
+  2. Abnormal Posture: 4 dieu kien ket hop, nguong mo rong de bat near-wall
+  3. Slump/Collapse  : Trend aspect ratio + velocity trung binh (dot quy cham)
+
+Cac fix tu v4:
+  - Vel detector dung MAX trong buffer thay vi MEAN (bat duoc sudden drop)
+  - Loai bo kpt co y=0 (vi tri mac dinh) khoi tinh bbox
+  - near-wall fallback: neu nose_y khong the xac dinh -> dung shoulder
+  - SLUMP_SUSTAINED = 6 (giam tu 10 de bat som hon)
 """
 import numpy as np
+from collections import deque
+
 
 class StrokeRecognizer:
-    def __init__(self, confidence_threshold=0.5):
-        self.confidence_threshold = confidence_threshold
-        # COCO Keypoints:
-        #   0: Nose, 5: L_Shoulder, 6: R_Shoulder
-        #   11: L_Hip, 12: R_Hip, 13: L_Knee, 14: R_Knee
+    # ── Ngưỡng có thể chỉnh ────────────────────────────────────
+    KPTS_CONF          = 0.28
+    MIN_VALID_KPTS     = 5
 
-        # Bộ đếm frame liên tiếp để tránh false positive thoáng qua
-        self._sustained_count = {}   # track_id -> int
-        self.SUSTAINED_THRESHOLD = 8  # Cần >= 8 frame liên tiếp
+    # Detector 1 — Sudden Fall
+    SUDDEN_VEL_RATIO   = 0.10   # max hip velocity / H trong cua so
+    VEL_WINDOW         = 5      # so frame de giu velocity
 
-    def analyze(self, history, img_size, track_id=0):
-        """
-        Analyze 17-point keypoints history.
-        history: List of np.array(17, 3)
-        track_id: Dùng để theo dõi sustained frames (mặc định 0 nếu không truyền)
-        """
+    # Detector 2 — Abnormal Posture
+    ASPECT_RATIO_MIN   = 1.4    # nguong aspect ratio (giam de bat near-wall)
+    BBOX_H_MAX_RATIO   = 0.40   # tang de bat nguoi ngoi guc sap xuong
+    HEAD_HIP_MARGIN    = 0.12   # tang de xu ly nga nghieng (head o ben canh)
+    TREND_ASPECT_MIN   = 1.2
+    KNEE_GAP_MAX_RATIO = 0.16   # 16%H: cui 90 gap=20% (no alert), nga flat gap=1% (alert)
+    SUSTAINED_POSTURE  = 8
+
+    # Detector 3 — Slump (dot quy cham)
+    SLUMP_ASPECT_MIN   = 1.0
+    SLUMP_VEL_RATIO    = 0.03
+    SLUMP_WINDOW       = 12
+    SLUMP_SUSTAINED    = 6      # giam tu 10 de bat som hon
+
+    def __init__(self):
+        self._sustained_posture : dict[int, int]   = {}
+        self._sustained_slump   : dict[int, int]   = {}
+        self._vel_history       : dict[int, deque] = {}
+        self._aspect_history    : dict[int, deque] = {}
+
+    # ─────────────────────────────────────────────────────────
+    def analyze(self, history: list, img_size: tuple, track_id: int = 0) -> dict:
         if len(history) < 5:
-            self._reset_sustained(track_id)
+            self._reset(track_id)
             return self._result(False, 0.0, 'Normal', 'low')
 
-        pts = np.array(history)  # (T, 17, 3)
+        pts  = np.array(history)
         w, h = img_size
 
-        # ─────────────────────────────────────────────
-        # 1. Phát hiện Ngã đột ngột (Sudden Fall)
-        #    Dùng trung điểm hông (Index 11, 12)
-        # ─────────────────────────────────────────────
-        hips_y = (pts[:, 11, 1] + pts[:, 12, 1]) / 2
-        y_velocity = np.diff(hips_y)
-        max_velocity = np.max(y_velocity) if len(y_velocity) > 0 else 0
+        if track_id not in self._vel_history:
+            self._vel_history[track_id]    = deque(maxlen=self.VEL_WINDOW)
+            self._aspect_history[track_id] = deque(maxlen=self.SLUMP_WINDOW)
 
-        if max_velocity > 0.15 * h:
-            # Ngã đột ngột → báo ngay (không cần sustained)
-            self._reset_sustained(track_id)
-            return self._result(True, 0.9, 'Sudden_Fall', 'high')
-
-        # ─────────────────────────────────────────────
-        # 2. Phát hiện Tư thế Nằm Ngang (Abnormal Posture)
-        #    Yêu cầu nhiều điều kiện kết hợp để tránh false positive
-        # ─────────────────────────────────────────────
-        latest_pts = pts[-1]
-        valid_kpts = latest_pts[latest_pts[:, 2] > 0.3]
-
-        if len(valid_kpts) < 5:
-            self._reset_sustained(track_id)
+        # ── Lay frame cuoi ──────────────────────────────────
+        latest = pts[-1]
+        # Chi lay kpt co conf OK VA co vi tri thuc (y > 0 va x > 0)
+        valid_mask = (latest[:, 2] > self.KPTS_CONF) & (latest[:, 0] > 0) & (latest[:, 1] > 0)
+        valid  = latest[valid_mask]
+        if len(valid) < self.MIN_VALID_KPTS:
+            self._reset(track_id)
             return self._result(False, 0.0, 'Normal', 'low')
 
-        x_min, y_min = np.min(valid_kpts[:, 0]), np.min(valid_kpts[:, 1])
-        x_max, y_max = np.max(valid_kpts[:, 0]), np.max(valid_kpts[:, 1])
+        # ── Cap nhat velocity buffer ────────────────────────
+        hip_y_series = (pts[:, 11, 1] + pts[:, 12, 1]) / 2
+        vel_series   = np.diff(hip_y_series)
+        if len(vel_series) > 0:
+            # Them moi PHAN TU CUOI vao buffer (khong them trung binh)
+            self._vel_history[track_id].append(float(vel_series[-1]))
 
-        bbox_w = x_max - x_min
-        bbox_h = y_max - y_min
-        aspect_ratio = bbox_w / (bbox_h + 1e-6)
+        # ── Cap nhat aspect history ─────────────────────────
+        cur_ar = float(np.ptp(valid[:, 0])) / (float(np.ptp(valid[:, 1])) + 1e-6)
+        self._aspect_history[track_id].append(cur_ar)
 
-        # Điều kiện 1: Bounding box phải nằm ngang rõ ràng (tăng từ 1.3 → 1.6)
-        cond_horizontal = aspect_ratio > 1.6 and bbox_h < 0.35 * h
+        # ══════════════════════════════════════════════════
+        # DETECTOR 1: Sudden Fall — MAX velocity trong buffer
+        # ══════════════════════════════════════════════════
+        vel_buf = self._vel_history[track_id]
+        max_vel = float(np.max(vel_buf)) if vel_buf else 0.0
 
-        # Điều kiện 2: Đầu (Nose) phải ở vị trí bất thường so với hông
-        #   Khi ngã/nằm, đầu sẽ thấp ngang hoặc thấp hơn hông
-        nose = latest_pts[0]
-        l_hip = latest_pts[11]
-        r_hip = latest_pts[12]
+        if max_vel > self.SUDDEN_VEL_RATIO * h:
+            self._reset(track_id)
+            return self._result(True, 0.92, 'Sudden_Fall', 'high')
+
+        # ══════════════════════════════════════════════════
+        # DETECTOR 2: Abnormal Posture
+        # ══════════════════════════════════════════════════
+        bbox_w = float(np.ptp(valid[:, 0]))
+        bbox_h = float(np.ptp(valid[:, 1]))
+        aspect = bbox_w / (bbox_h + 1e-6)
+
+        cond_horizontal = (aspect > self.ASPECT_RATIO_MIN
+                           and bbox_h < self.BBOX_H_MAX_RATIO * h)
+
+        # Dieu kien 2: Dau (hoac vai) o vi tri thap bat thuong
+        nose  = latest[0];  l_hip = latest[11]; r_hip = latest[12]
+        l_sho = latest[5];  r_sho = latest[6]
         cond_head_low = False
-        if nose[2] > 0.3 and l_hip[2] > 0.3 and r_hip[2] > 0.3:
-            hip_y_avg = (l_hip[1] + r_hip[1]) / 2
-            # Đầu gần bằng hoặc thấp hơn hông (trong 10% chiều cao frame)
-            cond_head_low = nose[1] > (hip_y_avg - 0.10 * h)
+        hip_y = (l_hip[1] + r_hip[1]) / 2 if (l_hip[2] > self.KPTS_CONF and r_hip[2] > self.KPTS_CONF) else -1
 
-        # Điều kiện 3: Kiểm tra xu hướng nhiều frame (không chỉ 1 frame)
-        #   Aspect ratio trong 3 frame cuối đều > 1.4
+        if hip_y > 0:
+            if nose[2] > self.KPTS_CONF:
+                # Dau nam trong 12% so voi hong (tang vien de xu ly nga nghieng)
+                cond_head_low = nose[1] > (hip_y - self.HEAD_HIP_MARGIN * h)
+            elif l_sho[2] > self.KPTS_CONF and r_sho[2] > self.KPTS_CONF:
+                # Fallback: dung vai neu khong thay mat (nga sap / bi che mat)
+                sho_y = (l_sho[1] + r_sho[1]) / 2
+                cond_head_low = sho_y > (hip_y - self.HEAD_HIP_MARGIN * h)
+
+        # Dieu kien 3: Xu huong lien tuc qua 3 frames
+        cond_trend = False
         if len(pts) >= 3:
-            recent_ratios = []
+            ratios = []
             for p in pts[-3:]:
-                vk = p[p[:, 2] > 0.3]
-                if len(vk) >= 5:
-                    rw = np.max(vk[:, 0]) - np.min(vk[:, 0])
-                    rh = np.max(vk[:, 1]) - np.min(vk[:, 1])
-                    recent_ratios.append(rw / (rh + 1e-6))
-            cond_trend = len(recent_ratios) == 3 and all(r > 1.4 for r in recent_ratios)
+                vm = (p[:, 2] > self.KPTS_CONF) & (p[:, 0] > 0) & (p[:, 1] > 0)
+                vk = p[vm]
+                if len(vk) >= self.MIN_VALID_KPTS:
+                    ratios.append(float(np.ptp(vk[:,0])) / (float(np.ptp(vk[:,1])) + 1e-6))
+            cond_trend = len(ratios) == 3 and all(r > self.TREND_ASPECT_MIN for r in ratios)
+
+        # Dieu kien 4: Chan bi suy sup / nam ngang
+        l_knee = latest[13]; r_knee = latest[14]
+        cond_legs = False
+        if all(k[2] > self.KPTS_CONF for k in [l_hip, r_hip, l_knee, r_knee]):
+            knee_y = (l_knee[1] + r_knee[1]) / 2
+            cond_legs = (knee_y - hip_y) < self.KNEE_GAP_MAX_RATIO * h
+
+        is_posture_bad = cond_horizontal and cond_head_low and cond_trend and cond_legs
+
+        if is_posture_bad:
+            cnt = self._sustained_posture.get(track_id, 0) + 1
+            self._sustained_posture[track_id] = cnt
+            if cnt >= self.SUSTAINED_POSTURE:
+                return self._result(True, 0.87, 'Abnormal_Posture', 'high')
+            return self._result(False, 0.0, 'Observing', 'low')
         else:
-            cond_trend = False
+            self._sustained_posture[track_id] = 0
 
-        # Kết hợp: Cần TẤT CẢ 3 điều kiện
-        is_abnormal = cond_horizontal and cond_head_low and cond_trend
+        # ══════════════════════════════════════════════════
+        # DETECTOR 3: Slump / Gradual Collapse
+        # ══════════════════════════════════════════════════
+        ar_buf = list(self._aspect_history[track_id])
+        if len(ar_buf) >= self.SLUMP_WINDOW:
+            half    = self.SLUMP_WINDOW // 2
+            ar_early = float(np.mean(ar_buf[:half]))
+            ar_late  = float(np.mean(ar_buf[half:]))
+            ar_trend_up = ar_late > ar_early + 0.20
 
-        if is_abnormal:
-            # Tăng bộ đếm sustained
-            count = self._sustained_count.get(track_id, 0) + 1
-            self._sustained_count[track_id] = count
+            # Velocity trung binh trong buffer phai > nguong slump
+            avg_vel = float(np.mean(list(vel_buf))) if vel_buf else 0.0
+            vel_positive = avg_vel > self.SLUMP_VEL_RATIO * h
 
-            if count >= self.SUSTAINED_THRESHOLD:
-                return self._result(True, 0.85, 'Abnormal_Posture', 'high')
-            else:
-                # Đang trong quá trình tích luỹ frame — chưa báo
+            cur_ar_ok = ar_late > self.SLUMP_ASPECT_MIN
+
+            if ar_trend_up and vel_positive and cur_ar_ok:
+                cnt2 = self._sustained_slump.get(track_id, 0) + 1
+                self._sustained_slump[track_id] = cnt2
+                if cnt2 >= self.SLUMP_SUSTAINED:
+                    return self._result(True, 0.78, 'Gradual_Collapse', 'high')
                 return self._result(False, 0.0, 'Observing', 'low')
+            else:
+                self._sustained_slump[track_id] = 0
         else:
-            # Reset bộ đếm nếu điều kiện không còn thỏa
-            self._reset_sustained(track_id)
-            return self._result(False, 0.0, 'Normal', 'low')
+            self._sustained_slump[track_id] = 0
 
-    def _reset_sustained(self, track_id):
-        self._sustained_count[track_id] = 0
+        return self._result(False, 0.0, 'Normal', 'low')
 
-    def _result(self, detected, confidence, symptom, risk):
-        return {
-            'detected': detected,
-            'confidence': confidence,
-            'symptom': symptom,
-            'risk_level': risk
-        }
+    # ─────────────────────────────────────────────────────────
+    def _reset(self, track_id: int):
+        self._sustained_posture[track_id] = 0
+        self._sustained_slump[track_id]   = 0
+        if track_id in self._vel_history:
+            self._vel_history[track_id].clear()
+        if track_id in self._aspect_history:
+            self._aspect_history[track_id].clear()
+
+    @staticmethod
+    def _result(detected, confidence, symptom, risk):
+        return {'detected': detected, 'confidence': confidence,
+                'symptom': symptom, 'risk_level': risk}

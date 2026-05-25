@@ -1,31 +1,32 @@
 """
-Object Tracker wrapper for YOLOv8 Tracking
+Object Tracker — wraps per-person keypoint history.
+v2: Uses collections.deque (O(1) append/pop) instead of list.pop(0).
+    track_id now comes from YOLOv8 ByteTrack (stable across frames).
 """
-import numpy as np
+from collections import deque
+
 
 class Tracker:
-    def __init__(self):
+    def __init__(self, max_history=30):
         """
-        YOLOv8 has built-in tracking (ByteTrack/BoT-SORT)
-        This class will help manage track history if needed
+        Args:
+            max_history: number of frames to keep per person
         """
-        self.track_history = {} # track_id -> list of keypoints/states
-        
-    def update_history(self, track_id, data, max_len=30):
-        """Keep a buffer of data for each track"""
-        if track_id not in self.track_history:
-            self.track_history[track_id] = []
-        
-        self.track_history[track_id].append(data)
-        
-        if len(self.track_history[track_id]) > max_len:
-            self.track_history[track_id].pop(0)
-            
-    def get_history(self, track_id):
-        return self.track_history.get(track_id, [])
+        self.max_history  = max_history
+        self.track_history: dict[int, deque] = {}
 
-    def clean_old_tracks(self, active_ids):
-        """Remove tracks that are no longer active"""
+    def update_history(self, track_id: int, data):
+        """Append keypoints/state for a tracked person."""
+        if track_id not in self.track_history:
+            self.track_history[track_id] = deque(maxlen=self.max_history)
+        self.track_history[track_id].append(data)
+
+    def get_history(self, track_id: int) -> list:
+        """Return history as a plain list (for numpy compatibility)."""
+        return list(self.track_history.get(track_id, []))
+
+    def clean_old_tracks(self, active_ids: list[int]):
+        """Remove tracks that are no longer visible."""
         inactive = [tid for tid in self.track_history if tid not in active_ids]
         for tid in inactive:
             del self.track_history[tid]
