@@ -10,7 +10,8 @@ from typing import Optional
 
 BAGGAGE_CLASS_IDS = {24: 'backpack', 26: 'handbag', 28: 'suitcase'}
 
-OWNER_RADIUS_PX  = 160
+OWNER_RADIUS_PX  = 160   # Bán kính center-to-center (px)
+PROXIMITY_EXPAND = 80    # Mở rộng bbox của hành lý để kiểm tra chồng lấn
 ABANDON_TIMEOUT  = 60.0
 ALERT_COOLDOWN   = 120.0
 
@@ -29,6 +30,8 @@ class BaggageState:
     alert_count  : int     = 0
     alerted      : bool    = False
     db_synced    : bool    = False
+    # Trạng thái chủ hành lý frame trước (để phát hiện transition)
+    _prev_has_owner: bool  = True   # Giả sử ban đầu có chủ để tránh false alarm ngay lúc xuất hiện
 
     @property
     def abandon_seconds(self) -> float:
@@ -206,7 +209,15 @@ class AbandonedBaggageTracker:
             cy = (bbox[1] + bbox[3]) / 2
 
             # ── Kiểm tra owner ──────────────────────────────
-            has_owner = self._has_nearby_person(cx, cy, persons)
+            has_owner = self._has_nearby_person(cx, cy, bbox, persons)
+
+            # Phat hien transition owner
+            if state._prev_has_owner and not has_owner:
+                print(f"[BaggageTracker] #{tid} [OWNER LEFT] {cls} -- bat dau dem thoi gian")
+            # Phat hien transition: owner quay lai
+            elif not state._prev_has_owner and has_owner:
+                print(f"[BaggageTracker] #{tid} [OWNER BACK] {cls}")
+            state._prev_has_owner = has_owner
 
             if has_owner:
                 # Có người đứng gần túi
@@ -281,18 +292,40 @@ class AbandonedBaggageTracker:
 
     # ── INTERNAL ───────────────────────────────────────────────
     def _has_nearby_person(
-        self, cx: float, cy: float, persons: list[dict]
+        self, cx: float, cy: float, bag_bbox: list, persons: list[dict]
     ) -> bool:
-        """Kiểm tra xem có người nào đứng trong radius không (conf >= 0.35)."""
+        """
+        Kiểm tra xem có người nào đứng gần hành lý không.
+        Dùng 2 phương pháp song song:
+          1. Center-to-center distance <= owner_radius
+          2. Expanded bag bbox có chồng lấn với person bbox
+             (để bắt người cao đứng sát bên, tâm xa nhưng bbox overlap)
+        conf người tối thiểu 0.35.
+        """
+        bx1, by1, bx2, by2 = bag_bbox[:4]
+        # Mở rộng bbox hành lý theo 4 hướng
+        ex1 = bx1 - PROXIMITY_EXPAND
+        ey1 = by1 - PROXIMITY_EXPAND
+        ex2 = bx2 + PROXIMITY_EXPAND
+        ey2 = by2 + PROXIMITY_EXPAND
+
         for p in persons:
             if p.get('conf', 0) < 0.35:
                 continue
             pb = p.get('bbox', [])
             if len(pb) < 4:
                 continue
-            px = (pb[0] + pb[2]) / 2
-            py = (pb[1] + pb[3]) / 2
-            if np.hypot(cx - px, cy - py) <= self.owner_radius:
+            px1, py1, px2, py2 = pb[:4]
+            pcx = (px1 + px2) / 2
+            pcy = (py1 + py2) / 2
+
+            # Phương pháp 1: center-to-center distance
+            if np.hypot(cx - pcx, cy - pcy) <= self.owner_radius:
                 return True
+
+            # Phương pháp 2: expanded bag bbox overlap với person bbox
+            if (ex1 < px2 and ex2 > px1 and ey1 < py2 and ey2 > py1):
+                return True
+
         return False
 

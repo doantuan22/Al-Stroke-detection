@@ -12,7 +12,7 @@ from app.gui.main_window import StrokeApp
 
 def main():
     print("="*60)
-    print("AI Stroke")
+    print("Hệ thống nhận diện nguy hiểm bằng AI")
     print("="*60)
     
     # Initialize application

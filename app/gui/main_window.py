@@ -571,7 +571,7 @@ class StrokeApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("AI Safety Dashboard — v4 (Stroke + Airport)")
+        self.title("Hệ thống nhận diện nguy hiểm bằng AI")
         self.geometry("1440x880")
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
@@ -635,10 +635,10 @@ class StrokeApp(ctk.CTk):
         sidebar.grid(row=0, column=0, sticky="nsew")
         sidebar.grid_propagate(False)
 
-        ctk.CTkLabel(sidebar, text="🧠 STROKE AI",
+        ctk.CTkLabel(sidebar, text="🚨 DANGER AI",
                      font=ctk.CTkFont(size=22, weight="bold"),
-                     text_color="#a6e3a1").pack(pady=(24, 4))
-        ctk.CTkLabel(sidebar, text="Hệ thống phát hiện đột quỵ",
+                     text_color="#f38ba8").pack(pady=(24, 4))
+        ctk.CTkLabel(sidebar, text="Hệ thống nhận diện nguy hiểm bằng AI",
                      font=ctk.CTkFont(size=10),
                      text_color="gray").pack(pady=(0, 20))
 

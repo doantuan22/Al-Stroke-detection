@@ -50,19 +50,22 @@ def draw_baggage_overlays(
         # ── Chọn màu theo trạng thái ─────────────────────
         if state.owner_gone_at is None:
             color       = COLOR_SAFE
-            status_text = f"{state.object_class} ✓ có chủ"
+            status_text = f"{state.object_class} co chu"
             thickness   = 2
         elif elapsed < abandon_timeout:
             ratio       = elapsed / abandon_timeout
             color       = COLOR_WARNING
             remaining   = abandon_timeout - elapsed
-            status_text = f"{state.object_class} ⚠ {remaining:.0f}s"
+            # Phân biệt: chủ vừa rời đi vs không có chủ ngay từ đầu
+            owner_left = getattr(state, '_prev_has_owner', False) is False  # người từng có mặt
+            label_prefix = "chu roi" if state.alert_count == 0 and elapsed < 5 else ""
+            status_text = f"{state.object_class} [{remaining:.0f}s]"
             thickness   = 2
             # Vẽ progress bar bên dưới box
             _draw_progress_bar(frame, x1, y2, x2, y2 + 6, ratio, COLOR_WARNING)
         else:
             color       = COLOR_DANGER
-            status_text = f"{state.object_class} 🚨 BỎ LẠI {elapsed:.0f}s"
+            status_text = f"{state.object_class} BO LAI {elapsed:.0f}s"
             thickness   = 3
             # Hiệu ứng nhấp nháy khi đã alert
             if int(time.time() * 2) % 2 == 0:
