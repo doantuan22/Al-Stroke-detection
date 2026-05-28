@@ -9,7 +9,7 @@ import cv2
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import customtkinter as ctk
-from PIL import Image
+from PIL import Image, ImageTk
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -572,10 +572,26 @@ class StrokeApp(ctk.CTk):
         super().__init__()
 
         self.title("Hệ thống nhận diện nguy hiểm bằng AI")
-        self.geometry("1440x880")
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # ── Responsive window: mở rộng tối đa ngay khi khởi động ──
+        # Trên màn hình lớn và laptop đều hiển thị đầy đủ không bị khuất
+        self.update_idletasks()                      # bắt buộc tk render xong
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        # Kích thước tối thiểu đảm bảo GUI không bị vỡ bố cục
+        self.minsize(900, 580)
+        # Mở cửa sổ ở trạng thái maximized → tự động fit với mọi độ phân giải
+        self.state('zoomed')
+        # Lưu thông tin màn hình để các widget dùng
+        self._screen_w = sw
+        self._screen_h = sh
+        # Chiều rộng sidebar: nhỏ hơn trên màn hình nhỏ
+        self._sidebar_w = 200 if sw < 1400 else 230
+        # Chiều cao log panel: gọn hơn trên màn hình nhỏ
+        self._log_h = 90 if sh < 800 else 120
 
         # ── Stroke Engines ────────────────────────────────────
         self.detector   = PoseDetector(input_size=640)
@@ -617,6 +633,8 @@ class StrokeApp(ctk.CTk):
         self.last_alert_time = {}
         self._total_alerts   = 0
         self._airport_alerts = 0   # counter airport alerts
+        # Cache kết quả nhận diện per-track (dùng khi frame skip)
+        self._last_person_results: dict[int, dict] = {}
 
         # ── Weapon alert overlay cache (hiển thị 3s sau khi detect) ──
         self._weapon_flash: list[dict] = []
@@ -630,7 +648,7 @@ class StrokeApp(ctk.CTk):
         self.grid_rowconfigure(0, weight=1)
 
         # ── Sidebar ──
-        sidebar = ctk.CTkFrame(self, width=230, corner_radius=0,
+        sidebar = ctk.CTkFrame(self, width=self._sidebar_w, corner_radius=0,
                                fg_color="#13131f")
         sidebar.grid(row=0, column=0, sticky="nsew")
         sidebar.grid_propagate(False)
@@ -749,11 +767,22 @@ class StrokeApp(ctk.CTk):
         det_frame.grid_columnconfigure(0, weight=1)
         det_frame.grid_rowconfigure(0, weight=1)
 
-        self.video_canvas = ctk.CTkLabel(det_frame, text="")
+        # Dùng tk.Canvas thay vì CTkLabel để hiển thị video
+        # Canvas có kích thước CỐ ĐỊNH theo grid → winfo_width/height()
+        # luôn trả về kích thước thật của vùng chứa, co giãn theo cửa sổ.
+        # CTkLabel cũ tự phình theo ảnh → vòng resize không bao giờ thu nhỏ.
+        self.video_canvas = tk.Canvas(
+            det_frame,
+            bg='black',
+            highlightthickness=0,   # không viền xanh của tk.Canvas
+            bd=0
+        )
         self.video_canvas.grid(row=0, column=0, sticky="nsew")
+        self._det_frame = det_frame
+        self._video_photo = None   # giữ reference ImageTk.PhotoImage
 
         self.log_panel = ctk.CTkTextbox(
-            det_frame, height=130,
+            det_frame, height=self._log_h,
             font=ctk.CTkFont(family="Consolas", size=10),
             fg_color="#13131f", text_color="#a6e3a1")
         self.log_panel.grid(row=1, column=0, padx=6, pady=(4, 6), sticky="ew")
@@ -920,7 +949,8 @@ class StrokeApp(ctk.CTk):
                     if result['detected'] and result['risk_level'] == 'high':
                         now   = time.time()
                         count = self.alert_count.get(track_id, 0)
-                        if count < 3 and (now - self.last_alert_time.get(track_id, 0)) >= 10:
+                        # Chup anh moi 5s, toi da 3 lan — lan thu 3 gui len DB
+                        if count < 3 and (now - self.last_alert_time.get(track_id, 0)) >= 5:
                             cnt = count + 1
                             self._total_alerts += 1
                             self.alert_count[track_id]     = cnt
@@ -933,16 +963,29 @@ class StrokeApp(ctk.CTk):
                             frame_copy = frame.copy()
                             self._upload_pool.submit(
                                 self._async_upload, frame_copy, track_id, result, cnt)
-                    res['_result'] = result
+                    # Lưu kết quả vào cache riêng per-track (không lưu trong res dict)
+                    self._last_person_results[track_id] = result
                 else:
-                    result = res.get('_result', self.recognizer._result(
-                        False, 0.0, 'Normal', 'low'))
+                    # Frame skip: lấy kết quả cache của từng người riêng biệt
+                    # → mỗi track_id có kết quả độc lập, không bị ghi đè bởi người khác
+                    result = self._last_person_results.get(
+                        track_id, self.recognizer._result(False, 0.0, 'Normal', 'low'))
 
                 frame = draw_skeleton(frame, kpts)
                 frame = draw_info(frame, track_id, bbox, result)
 
             if run_inference:
                 self.tracker.clean_old_tracks(active_ids)
+                # Dọn state recognizer CHỈ KHI Tracker đã thực sự xóa track
+                # (sau grace period _GRACE_FRAMES=15 frame vắng mặt).
+                # KHÔNG xóa ngay khi YOLO bỏ sót 1-2 frame — như vậy
+                # history vẫn được giữ nguyên và nhận diện không bị chập chờn.
+                still_in_tracker = set(self.tracker.track_history.keys())
+                all_cached = list(self._last_person_results.keys())
+                for lost_tid in all_cached:
+                    if lost_tid not in still_in_tracker:
+                        self.recognizer._clear_state(lost_tid)
+                        self._last_person_results.pop(lost_tid, None)
 
             # ── Airport detection (mỗi lần obj_ran) ──────────
             weapon_alerts = []
@@ -1061,17 +1104,37 @@ class StrokeApp(ctk.CTk):
 
         if not self.frame_queue.empty():
             frame = self.frame_queue.get()
+
+            # tk.Canvas winfo_width/height() = kích thước thực của canvas
+            # (không bị ảnh hưởng bởi nội dung vẽ bên trong)
+            # → tự động co giãn đúng khi thay đổi kích thước cửa sổ
             cw = self.video_canvas.winfo_width()
             ch = self.video_canvas.winfo_height()
-            if cw > 1 and ch > 1:
-                frame = cv2.resize(frame, (cw, ch))
-            img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            ctk_img = ctk.CTkImage(light_image=img, dark_image=img,
-                                   size=(cw, ch))
-            self.video_canvas._ctk_image = ctk_img  # giữ reference
-            self.video_canvas.configure(image=ctk_img)
 
-        self.after(1, self._ui_loop)
+            if cw > 4 and ch > 4:
+                fh, fw = frame.shape[:2]
+                # Letterbox: vừa khít, giữ tỉ lệ, không bóp không cắt
+                ratio = min(cw / fw, ch / fh)
+                nw    = max(1, int(fw * ratio))
+                nh    = max(1, int(fh * ratio))
+                frame = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
+            else:
+                nw, nh = frame.shape[1], frame.shape[0]
+                cw, ch = nw, nh
+
+            img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            # ImageTk.PhotoImage — phương pháp đúng cho tk.Canvas
+            self._video_photo = ImageTk.PhotoImage(image=img)
+
+            # Vẽ ảnh vào giữa canvas (letterbox → hai bên có viền đen tự động)
+            self.video_canvas.delete("all")
+            self.video_canvas.create_image(
+                cw // 2, ch // 2,
+                anchor="center",
+                image=self._video_photo
+            )
+
+        self.after(33, self._ui_loop)   # ~30fps render rate
 
 
 if __name__ == "__main__":

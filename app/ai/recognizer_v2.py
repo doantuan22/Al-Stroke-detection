@@ -35,6 +35,10 @@ class StrokeConfig:
     slump_sustained: int = 5
 
 
+# Số frame giữ trạng thái detected=True sau khi phát hiện (tránh flicker)
+_DETECT_COOLDOWN_FRAMES = 20
+
+
 class StrokeRecognizerV2:
     
     def __init__(self, config: Optional[StrokeConfig] = None, debug: bool = False):
@@ -46,14 +50,34 @@ class StrokeRecognizerV2:
         self._vel_history: dict[int, deque] = {}
         self._aspect_history: dict[int, deque] = {}
         
+        # Cooldown per track: số frame còn lại trong trạng thái "đang bị đột quỵ"
+        # Khi > 0: analyze() trả về detected=True ngay lập tức mà không cần tính lại
+        # Mỗi người (track_id) có cooldown độc lập → không ảnh hưởng lẫn nhau
+        self._detect_cooldown: dict[int, int] = {}
+        # Cache kết quả cuối để trả về trong thời gian cooldown
+        self._last_detect_result: dict[int, dict] = {}
+        
         if self.debug:
             logger.setLevel(logging.DEBUG)
             logger.info(f"[StrokeRecognizerV2] Initialized with config: {self.config}")
     
     
     def analyze(self, history: list, img_size: tuple, track_id: int = 0) -> dict:
+        # ── Kiểm tra cooldown: nếu đang trong thời gian giữ cảnh báo ──────
+        # Mỗi track_id có cooldown độc lập → nhiều người đột quỵ cùng lúc
+        # không ảnh hưởng lẫn nhau.
+        cooldown = self._detect_cooldown.get(track_id, 0)
+        if cooldown > 0:
+            self._detect_cooldown[track_id] = cooldown - 1
+            cached = self._last_detect_result.get(
+                track_id, self._result(True, 0.85, 'Detected', 'high'))
+            if self.debug:
+                logger.debug(f"[Track {track_id}] In cooldown ({cooldown} frames left), "
+                             f"returning cached: {cached['symptom']}")
+            return cached
+
         if len(history) < 5:
-            self._reset(track_id)
+            self._clear_state(track_id)
             return self._result(False, 0.0, 'Normal', 'low')
         
         pts = np.array(history)
@@ -74,28 +98,32 @@ class StrokeRecognizerV2:
         if len(valid) < self.config.min_valid_kpts:
             if self.debug:
                 logger.debug(f"[Track {track_id}] Insufficient valid keypoints: {len(valid)}")
-            self._reset(track_id)
+            self._clear_state(track_id)
             return self._result(False, 0.0, 'Normal', 'low')
         
         hip_y_series = (pts[:, 11, 1] + pts[:, 12, 1]) / 2
         vel_series = np.diff(hip_y_series)
         
-        for vel in vel_series:
-            self._vel_history[track_id].append(float(vel))
+        # Chỉ thêm giá trị CUỐI vào buffer (tránh thêm trùng các frame cũ)
+        if len(vel_series) > 0:
+            self._vel_history[track_id].append(float(vel_series[-1]))
         
         cur_ar = float(np.ptp(valid[:, 0])) / (float(np.ptp(valid[:, 1])) + 1e-6)
         self._aspect_history[track_id].append(cur_ar)
         
         result = self._detect_sudden_fall(track_id, h)
         if result['detected']:
+            self._start_cooldown(track_id, result)
             return result
         
         result = self._detect_abnormal_posture(track_id, pts, latest, valid, h)
         if result['detected']:
+            self._start_cooldown(track_id, result)
             return result
         
         result = self._detect_gradual_collapse(track_id, h)
         if result['detected']:
+            self._start_cooldown(track_id, result)
             return result
         
         return self._result(False, 0.0, 'Normal', 'low')
@@ -118,7 +146,7 @@ class StrokeRecognizerV2:
         if max_vel > threshold:
             if self.debug:
                 logger.info(f"[Track {track_id}] ✅ SUDDEN FALL DETECTED!")
-            self._reset(track_id)
+            # KHÔNG gọi _reset() ở đây — cooldown sẽ giữ trạng thái ổn định
             return self._result(True, 0.92, 'Sudden_Fall', 'high')
         
         return self._result(False, 0.0, 'Normal', 'low')
@@ -253,13 +281,37 @@ class StrokeRecognizerV2:
         return self._result(False, 0.0, 'Normal', 'low')
     
     
-    def _reset(self, track_id: int):
+    def _start_cooldown(self, track_id: int, result: dict):
+        """Bắt đầu cooldown sau khi phát hiện đột quỵ.
+        
+        Trong thời gian cooldown, analyze() trả về cached result mà không
+        tính lại — giúp loại bỏ flicker khi có nhiều người trong khung hình.
+        Buffer được GIỮ NGUYÊN (không xóa) để khi cooldown hết, detector
+        vẫn còn đủ dữ liệu để tiếp tục nhận diện.
+        """
+        self._detect_cooldown[track_id] = _DETECT_COOLDOWN_FRAMES
+        self._last_detect_result[track_id] = result
+        if self.debug:
+            logger.info(f"[Track {track_id}] 🔒 Cooldown started ({_DETECT_COOLDOWN_FRAMES} frames)")
+
+    def _clear_state(self, track_id: int):
+        """Xóa toàn bộ state khi track biến mất (history < 5 frames).
+        
+        Khác với _reset() cũ (gọi sau mỗi lần detect), _clear_state() chỉ
+        được gọi khi người thực sự rời khỏi khung hình.
+        """
         self._sustained_posture[track_id] = 0
         self._sustained_slump[track_id] = 0
+        self._detect_cooldown[track_id] = 0
+        self._last_detect_result.pop(track_id, None)
         if track_id in self._vel_history:
             self._vel_history[track_id].clear()
         if track_id in self._aspect_history:
             self._aspect_history[track_id].clear()
+
+    def _reset(self, track_id: int):
+        """Legacy alias — giữ để tương thích nếu bên ngoài gọi trực tiếp."""
+        self._clear_state(track_id)
     
     @staticmethod
     def _result(detected: bool, confidence: float, symptom: str, risk: str) -> dict:

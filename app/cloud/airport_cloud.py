@@ -16,6 +16,7 @@ Storage subfolders:
 import os
 import cv2
 import uuid
+import traceback
 from datetime import datetime, timezone
 from app.cloud.supabase import SupabaseClient
 
@@ -67,18 +68,30 @@ class AirportCloudClient(SupabaseClient):
             filename = f"{etype}_{ts}_{uid}.jpg"
             path     = f"{subfolder}/{filename}"
 
-            # ── 1. Encode + Upload ảnh ──────────────────────
+            # ── 1. Encode + Upload ảnh ───────────────────────────────
             _, buf = cv2.imencode(
                 '.jpg', frame,
                 [cv2.IMWRITE_JPEG_QUALITY, 85]
             )
-            self.client.storage.from_(self.bucket_name).upload(
-                path=path,
-                file=buf.tobytes(),
-                file_options={"content-type": "image/jpeg"},
-            )
+            # upsert=True → tránh lỗi file đã tồn tại (x-upsert header)
+            try:
+                self.client.storage.from_(self.bucket_name).upload(
+                    path=path,
+                    file=buf.tobytes(),
+                    file_options={
+                        "content-type": "image/jpeg",
+                        "upsert": "true",
+                    },
+                )
+            except Exception as upload_err:
+                print(f"[AirportCloud] Storage upload warning: {upload_err} — retrying as update...")
+                self.client.storage.from_(self.bucket_name).update(
+                    path=path,
+                    file=buf.tobytes(),
+                    file_options={"content-type": "image/jpeg"},
+                )
 
-            # ── 2. Lấy public URL ───────────────────────────
+            # ── 2. Lấy public URL ───────────────────────────────
             url = self.client.storage.from_(self.bucket_name).get_public_url(path)
 
             # ── 3. Insert vào airport_events ────────────────
@@ -102,11 +115,12 @@ class AirportCloudClient(SupabaseClient):
                 "created_at"  : datetime.now(timezone.utc).isoformat(),
             }
             self.client.table(self.AIRPORT_TABLE).insert(data).execute()
-            print(f"[AirportCloud] ✅ {etype} uploaded → {path}")
+            print(f"[AirportCloud] OK {etype} uploaded -> {path}")
             return url, path
 
         except Exception as e:
-            print(f"[AirportCloud] ❌ Upload failed: {e}")
+            print(f"[AirportCloud] FAILED Upload failed: {e}")
+            traceback.print_exc()
             return None, None
 
     # ── Realtime baggage_tracks upsert ──────────────────────────
@@ -137,7 +151,7 @@ class AirportCloudClient(SupabaseClient):
             ).execute()
             return True
         except Exception as e:
-            print(f"[AirportCloud] ❌ Baggage upsert failed: {e}")
+            print(f"[AirportCloud] Baggage upsert failed: {e}")
             return False
 
     # ── Fetch airport_events ────────────────────────────────────
@@ -174,7 +188,7 @@ class AirportCloudClient(SupabaseClient):
 
             return q.execute().data or []
         except Exception as e:
-            print(f"[AirportCloud] ❌ Fetch failed: {e}")
+            print(f"[AirportCloud] Fetch failed: {e}")
             return []
 
     # ── Delete airport_events ───────────────────────────────────
@@ -196,7 +210,7 @@ class AirportCloudClient(SupabaseClient):
             self.client.table(self.AIRPORT_TABLE).delete().eq("id", event_id).execute()
             return True
         except Exception as e:
-            print(f"[AirportCloud] ❌ Delete failed: {e}")
+            print(f"[AirportCloud] Delete failed: {e}")
             return False
 
     def delete_airport_events_batch(self, events: list[dict]) -> tuple[int, int]:
@@ -223,7 +237,7 @@ class AirportCloudClient(SupabaseClient):
                 except Exception:
                     fail += 1
         except Exception as e:
-            print(f"[AirportCloud] ❌ Batch delete failed: {e}")
+            print(f"[AirportCloud] Batch delete failed: {e}")
             fail = len(events) - success
 
         return success, fail
@@ -239,7 +253,7 @@ class AirportCloudClient(SupabaseClient):
             }).eq("id", event_id).execute()
             return True
         except Exception as e:
-            print(f"[AirportCloud] ❌ mark_resolved failed: {e}")
+            print(f"[AirportCloud] mark_resolved failed: {e}")
             return False
 
     # ── Baggage tracks cleanup ───────────────────────────────────
@@ -257,4 +271,4 @@ class AirportCloudClient(SupabaseClient):
                 self.client.table(self.BAGGAGE_TABLE)\
                     .delete().eq("track_id", tid).execute()
         except Exception as e:
-            print(f"[AirportCloud] ❌ Clean tracks failed: {e}")
+            print(f"[AirportCloud] Clean tracks failed: {e}")

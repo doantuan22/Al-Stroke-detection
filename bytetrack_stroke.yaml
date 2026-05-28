@@ -1,0 +1,26 @@
+# ByteTrack config tối ưu cho nhận diện đột quỵ nhiều người
+# Vấn đề gốc: người mặc đồ tương đồng màu nền (áo xám/sàn xám)
+# có confidence thấp → ByteTrack mất track → history reset → chập chờn
+
+tracker_type: bytetrack
+
+# Ngưỡng thấp hơn để giữ track của người có contrast thấp với nền
+track_high_thresh: 0.20   # mặc định 0.25 → hạ để không bỏ sót người bị nằm
+
+# Ngưỡng thứ 2 (low-score matching) — giữ nguyên
+track_low_thresh: 0.05
+
+# Ngưỡng tạo track mới — hạ xuống để nhanh nhận track người mới
+new_track_thresh: 0.20
+
+# Số frame giữ track khi bị mất (mặc định 30)
+# Tăng lên 60 (~2s ở 30fps) để track không bị xóa khi YOLO
+# bỏ sót vài frame do confidence thấp / bị che khuất tạm thời
+track_buffer: 60
+
+# Ngưỡng IoU để kết hợp track — hơi nới lỏng cho người nằm
+# (bounding box của người nằm thay đổi nhiều hơn người đứng)
+match_thresh: 0.75
+
+# Kết hợp detection score vào matching giúp track ổn định hơn
+fuse_score: True

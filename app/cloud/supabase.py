@@ -5,6 +5,7 @@ v3: Extract storage path from image_url — no extra column needed
 import os
 import cv2
 import uuid
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
@@ -26,10 +27,26 @@ class SupabaseClient:
                 self.client: Client = create_client(self.url, self.key)
                 self.enabled = True
                 print(f"[Cloud] Supabase connected: {self.url}")
+                self._ensure_bucket()
             except Exception as e:
                 print(f"[Cloud] Connection failed: {e}")
         else:
             print("[Cloud] Credentials missing in .env")
+
+    def _ensure_bucket(self):
+        """Tu tao bucket neu chua ton tai."""
+        try:
+            existing = {b.name for b in self.client.storage.list_buckets()}
+            if self.bucket_name not in existing:
+                self.client.storage.create_bucket(
+                    self.bucket_name,
+                    options={"public": True},
+                )
+                print(f"[Cloud] Bucket created: {self.bucket_name}")
+            else:
+                print(f"[Cloud] Bucket OK: {self.bucket_name}")
+        except Exception as e:
+            print(f"[Cloud] WARNING - Could not verify/create bucket: {e}")
 
     # ── Internal helper ────────────────────────────────────────────
     def _path_from_url(self, url: str) -> str | None:
@@ -66,14 +83,26 @@ class SupabaseClient:
             filename = f"{event_type}_{timestamp_str}.jpg"
             path = f"alerts/{filename}"
 
-            _, buffer = cv2.imencode('.jpg', frame)
+            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
 
-            # 1. Upload lên Storage
-            self.client.storage.from_(self.bucket_name).upload(
-                path=path,
-                file=buffer.tobytes(),
-                file_options={"content-type": "image/jpeg"}
-            )
+            # 1. Upload lên Storage (upsert=True tránh lỗi file đã tồn tại)
+            try:
+                self.client.storage.from_(self.bucket_name).upload(
+                    path=path,
+                    file=buffer.tobytes(),
+                    file_options={
+                        "content-type": "image/jpeg",
+                        "upsert": "true",
+                    },
+                )
+            except Exception as upload_err:
+                # File có thể đã tồn tại → thử update thay vì upload mới
+                print(f"[Cloud] Storage upload warning: {upload_err} — retrying as update...")
+                self.client.storage.from_(self.bucket_name).update(
+                    path=path,
+                    file=buffer.tobytes(),
+                    file_options={"content-type": "image/jpeg"},
+                )
 
             # 2. Lấy public URL
             public_url = self.client.storage.from_(self.bucket_name).get_public_url(path)
@@ -88,11 +117,12 @@ class SupabaseClient:
                 "event_type": result['symptom'],
             }
             self.client.table(self.table_name).insert(data).execute()
-
+            print(f"[Cloud] OK Stroke alert uploaded -> {path}")
             return public_url, path
 
         except Exception as e:
             print(f"[Cloud] Upload failed: {e}")
+            traceback.print_exc()
             return None, None
 
     def save_local(self, frame, track_id, result, folder='output/images'):
