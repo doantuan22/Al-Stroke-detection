@@ -32,9 +32,10 @@ FINETUNE_WEAPON_CLASSES = {
     4 : 'scissors',
 }
 
-WEAPON_CONF_MIN   = 0.25    # Ngưỡng confidence tối thiểu
-BEARER_RADIUS_PX  = 130     # Pixel tính là "người đang cầm"
-ALERT_COOLDOWN    = 25.0    # Giây giữa 2 alert cùng vị trí
+WEAPON_CONF_MIN   = 0.15    # Ngưỡng confidence tối thiểu (thấp hơn để bắt dao)
+BEARER_RADIUS_PX  = 200     # Pixel tính là "người đang cầm" (rộng hơn)
+ALERT_COOLDOWN    = 5.0     # Giây giữa 2 alert upload (ngắn hơn để upload thường xuyên)
+OVERLAY_PERSIST   = 2.0     # Giây giữ overlay sau khi mất detection
 
 
 
@@ -74,8 +75,12 @@ class WeaponDetector:
         )
         self.weapon_class_ids = list(self.weapon_classes.keys())
 
-        # Cooldown tracker per location key
+        # Cooldown tracker per location key (cho upload)
         self._last_alert: dict[str, float] = {}
+
+        # Persistent detection state: weapon đang nhìn thấy trong frame hiện tại
+        # Key: loc_key, Value: dict {bbox, class_name, conf, last_seen, bearer_id}
+        self._active_detections: dict[str, dict] = {}
 
     # ── PUBLIC ─────────────────────────────────────────────────
     def detect_frame(
@@ -88,6 +93,10 @@ class WeaponDetector:
         """
         Detect vũ khí từ obj_results (đã track) hoặc frame và tạo alerts.
 
+        Trả về 2 loại:
+        - upload_alerts : alerts mới cần gửi lên cloud (theo cooldown)
+        - overlay_detections : TẤT CẢ weapons đang nhìn thấy (dùng cho overlay)
+
         Args:
             frame_or_objs : list[dict] kết quả track hoặc BGR numpy array
             persons       : Danh sách từ PoseDetector.track()
@@ -95,18 +104,16 @@ class WeaponDetector:
             camera_id     : ID camera
 
         Returns:
-            alerts: list[dict]
+            alerts: list[dict]  — chỉ chứa alerts ĐỦ ĐIỀU KIỆN upload (cooldown OK)
         """
         import numpy as np
         if isinstance(frame_or_objs, list):
-            # Tái sử dụng kết quả object detection đã chạy
             all_objects = [
                 obj for obj in frame_or_objs
                 if obj.get('class_id') in self.weapon_class_ids
                 and obj.get('conf', 0) >= self.conf
             ]
         else:
-            # Fallback chạy inference nếu truyền vào frame numpy
             all_objects = self.od.detect(
                 frame_or_objs,
                 classes=self.weapon_class_ids,
@@ -115,6 +122,7 @@ class WeaponDetector:
 
         alerts = []
         now    = time.time()
+        seen_keys: set[str] = set()
 
         for obj in all_objects:
             cid  = obj['class_id']
@@ -128,16 +136,31 @@ class WeaponDetector:
             cx = (bbox[0] + bbox[2]) / 2
             cy = (bbox[1] + bbox[3]) / 2
 
-            # Cooldown check theo cell lưới 50px
-            loc_key = f"{class_name}_{int(cx//50)}_{int(cy//50)}"
-            if now - self._last_alert.get(loc_key, 0) < self.cooldown:
-                continue
+            # Cell lưới 80px (rộng hơn) để dao di chuyển nhẹ không tạo key mới
+            loc_key = f"{class_name}_{int(cx//80)}_{int(cy//80)}"
+            seen_keys.add(loc_key)
 
             # Xác định bearer (người đang cầm)
             bearer_id = self._find_bearer(cx, cy, persons)
 
             # Risk level
             risk = 'critical' if zone_name else 'high'
+
+            # Cập nhật persistent detection (dùng cho overlay liên tục)
+            self._active_detections[loc_key] = {
+                'bbox'        : bbox,
+                'class_name'  : class_name,
+                'conf'        : conf_val,
+                'bearer_id'   : bearer_id,
+                'risk_level'  : risk,
+                'zone_name'   : zone_name,
+                'camera_id'   : camera_id,
+                'last_seen'   : now,
+            }
+
+            # Cooldown check — chỉ upload khi đủ thời gian
+            if now - self._last_alert.get(loc_key, 0) < self.cooldown:
+                continue
 
             self._last_alert[loc_key] = now
             alerts.append({
@@ -153,7 +176,34 @@ class WeaponDetector:
                 'bearer_id'   : bearer_id,
             })
 
+        # Dọn các detection không còn nhìn thấy lâu hơn OVERLAY_PERSIST giây
+        expired = [
+            k for k, v in self._active_detections.items()
+            if now - v['last_seen'] > OVERLAY_PERSIST and k not in seen_keys
+        ]
+        for k in expired:
+            self._active_detections.pop(k, None)
+
         return alerts
+
+    def get_active_overlays(self) -> list[dict]:
+        """
+        Trả về danh sách weapon detections đang hiển thị (kể cả giữa các frame skip).
+        Dùng để vẽ overlay liên tục lên video — KHÔNG phụ thuộc vào cooldown upload.
+        """
+        now = time.time()
+        result = []
+        for det in self._active_detections.values():
+            if now - det['last_seen'] <= OVERLAY_PERSIST:
+                result.append({
+                    'event_type'  : 'weapon_detected',
+                    'object_class': det['class_name'],
+                    'bbox'        : det['bbox'],
+                    'confidence'  : det['conf'],
+                    'bearer_id'   : det['bearer_id'],
+                    'risk_level'  : det['risk_level'],
+                })
+        return result
 
     # ── INTERNAL ───────────────────────────────────────────────
     def _find_bearer(

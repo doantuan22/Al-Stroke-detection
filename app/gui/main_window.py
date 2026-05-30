@@ -601,7 +601,12 @@ class StrokeApp(ctk.CTk):
         # ── Airport Engines ───────────────────────────────────
         self.obj_detector    = ObjectDetector(model_path='yolov8n.pt', object_skip=3)
         self.baggage_tracker = AbandonedBaggageTracker(camera_id='CAM_00')
-        self.weapon_detector = WeaponDetector(self.obj_detector)
+        self.weapon_detector = WeaponDetector(
+            self.obj_detector,
+            conf=0.15,          # ngưỡng thấp để nhận dao dễ hơn
+            bearer_radius=200,  # tăng rá dò để bắt tốt hơn
+            cooldown=5.0,       # upload mỗi 5 giây
+        )
 
         # ── Cloud ─────────────────────────────────────────────
         self.cloud         = SupabaseClient()       # stroke_events
@@ -636,9 +641,8 @@ class StrokeApp(ctk.CTk):
         # Cache kết quả nhận diện per-track (dùng khi frame skip)
         self._last_person_results: dict[int, dict] = {}
 
-        # ── Weapon alert overlay cache (hiển thị 3s sau khi detect) ──
-        self._weapon_flash: list[dict] = []
-        self._weapon_flash_until: float = 0.0
+        # Weapon alert overlay: lấy tự weapon_detector.get_active_overlays() mỗi frame
+        # Không cần _weapon_flash state nữa — overlay là liên tục
 
         self._create_widgets()
 
@@ -1007,14 +1011,15 @@ class StrokeApp(ctk.CTk):
                     self._airport_alerts += 1
                     self.after(0, lambda a=alert:
                                self.log_msg(
-                                   f"⚔️ VẬT THỂ NGUY HIỂM: "
+                                   f"WEAPON: "
                                    f"{a['object_class']} conf={a['confidence']:.0%}"))
                     self._upload_pool.submit(
                         self._async_airport_upload, frame.copy(), alert)
 
-                if weapon_alerts:
-                    self._weapon_flash       = weapon_alerts
-                    self._weapon_flash_until = time.time() + 3.0
+            else:
+                # Frame skip: vẫn chạy detect_frame với cache để cập nhật active_detections
+                self.weapon_detector.detect_frame(
+                    self._last_obj_results, results, camera_id=self.camera_id)
 
                 # Periodic DB sync
                 self._db_sync_counter += 1
@@ -1031,7 +1036,7 @@ class StrokeApp(ctk.CTk):
                 states    = self.baggage_tracker.get_all_states()
                 n_bags    = len(states)
                 n_abandon = sum(1 for s in states.values() if s.alerted)
-                n_w       = len(weapon_alerts)
+                n_w       = len(self.weapon_detector.get_active_overlays())
                 self.after(0, lambda b=n_bags, a=n_abandon, w=n_w:
                            self.lbl_airport.configure(
                                text=f"Hành lý: {b} (!{a})  Vật thể: {w}"))
@@ -1039,9 +1044,13 @@ class StrokeApp(ctk.CTk):
             # ── Airport visualization ─────────────────────────
             states = self.baggage_tracker.get_all_states()
             frame  = draw_baggage_overlays(frame, states, abandon_timeout=self.baggage_tracker.timeout)
-            if time.time() < self._weapon_flash_until:
-                frame = draw_weapon_alerts(frame, self._weapon_flash)
-            n_w_hud = len(self._weapon_flash) if time.time() < self._weapon_flash_until else 0
+
+            # Overlay vũ khí liên tục: lấy từ persistent state, không phụ thuộc cooldown
+            active_weapons = self.weapon_detector.get_active_overlays()
+            if active_weapons:
+                frame = draw_weapon_alerts(frame, active_weapons)
+
+            n_w_hud = len(active_weapons)
             frame = draw_airport_stats(
                 frame, len(states),
                 sum(1 for s in states.values() if s.alerted),
