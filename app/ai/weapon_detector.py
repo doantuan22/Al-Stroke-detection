@@ -213,7 +213,7 @@ class WeaponDetector:
         best_dist = float('inf')
         best_id   = None
         for p in persons:
-            pb = p.get('bbox', [])
+            pb = p.get('bbox') or []
             if len(pb) < 4:
                 continue
             px = (pb[0] + pb[2]) / 2

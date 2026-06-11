@@ -904,206 +904,221 @@ class StrokeApp(ctk.CTk):
 
         cap = cv2.VideoCapture(self.source)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        # S1: Kiểm tra camera có mở được không
+        if not cap.isOpened():
+            self.is_running = False
+            self.after(0, lambda: (
+                self.log_msg(f"[ERROR] Khong mo duoc camera/video: {self.source}"),
+                self.start_btn.configure(text="▶  BAT DAU",
+                                         fg_color="#16a34a", hover_color="#15803d")
+            ))
+            return
+
         prev_time = time.time()
         self.obj_detector.reset_skip_counter()
 
-        while self.is_running:
-            ret, frame = cap.read()
-            if not ret:
-                break
+        try:
+            while self.is_running:
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
-            self._frame_counter += 1
-            run_inference = (self._frame_counter % self.FRAME_SKIP == 0)
+                # S3: Guard frame None / rong
+                if frame is None or frame.size == 0:
+                    continue
 
-            # ── POSE inference (Stroke) ──────────────────────
-            if run_inference:
-                results = self.detector.track(frame)
-                self._last_results = results
-            else:
-                results = self._last_results
+                # S4: Chuyen grayscale / RGBA ve BGR
+                if frame.ndim == 2:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                elif frame.ndim == 3 and frame.shape[2] == 4:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
 
-            # ── OBJECT inference (Airport, mỗi 3 frames) ────
-            # Hạ threshold gốc xuống 0.20 để bắt được các vật thể mờ/nhỏ/che khuất như dao, balo
-            obj_results, obj_ran = self.obj_detector.track(
-                frame,
-                classes=[24, 26, 28, 43, 76],
-                conf=0.20,
-            )
+                self._frame_counter += 1
+                run_inference = (self._frame_counter % self.FRAME_SKIP == 0)
 
-            if obj_ran:
-                self._last_obj_results = obj_results
-            else:
-                obj_results = self._last_obj_results
+                # ── POSE inference (Stroke) ──────────────────────
+                if run_inference:
+                    results = self.detector.track(frame)
+                    self._last_results = results
+                else:
+                    results = self._last_results
 
-            # ── Stroke detection loop ─────────────────────────
-            active_ids = []
-            for res in results:
-                bbox     = res['bbox']
-                kpts     = res['kpts']
-                track_id = res['track_id']
-                active_ids.append(track_id)
+                # ── OBJECT inference (Airport, moi 3 frames) ────
+                obj_results, obj_ran = self.obj_detector.track(
+                    frame,
+                    classes=[24, 26, 28, 43, 76],
+                    conf=0.20,
+                )
+
+                if obj_ran:
+                    self._last_obj_results = obj_results
+                else:
+                    obj_results = self._last_obj_results
+
+                # ── Stroke detection loop ─────────────────────────
+                active_ids = []
+                for res in results:
+                    bbox     = res['bbox']
+                    kpts     = res['kpts']
+                    track_id = res['track_id']
+                    active_ids.append(track_id)
+
+                    if run_inference:
+                        self.tracker.update_history(track_id, kpts)
+                        history = self.tracker.get_history(track_id)
+                        result  = self.recognizer.analyze(
+                            history, (frame.shape[1], frame.shape[0]),
+                            track_id=track_id)
+
+                        if result['detected'] and result['risk_level'] == 'high':
+                            now   = time.time()
+                            count = self.alert_count.get(track_id, 0)
+                            if count < 3 and (now - self.last_alert_time.get(track_id, 0)) >= 5:
+                                cnt = count + 1
+                                self._total_alerts += 1
+                                self.alert_count[track_id]     = cnt
+                                self.last_alert_time[track_id] = now
+                                self.after(0, lambda c=cnt, s=result['symptom']:
+                                           self.log_msg(f"\U0001f6a8 CANH BAO [{c}/3]: {s}"))
+                                self.after(0, lambda:
+                                           self.lbl_alerts.configure(
+                                               text=f"Canh bao: {self._total_alerts}"))
+                                frame_copy = frame.copy()
+                                self._upload_pool.submit(
+                                    self._async_upload, frame_copy, track_id, result, cnt)
+                        self._last_person_results[track_id] = result
+                    else:
+                        result = self._last_person_results.get(
+                            track_id, self.recognizer._result(False, 0.0, 'Normal', 'low'))
+
+                    frame = draw_skeleton(frame, kpts)
+                    frame = draw_info(frame, track_id, bbox, result)
 
                 if run_inference:
-                    self.tracker.update_history(track_id, kpts)
-                    history = self.tracker.get_history(track_id)
-                    result  = self.recognizer.analyze(
-                        history, (frame.shape[1], frame.shape[0]),
-                        track_id=track_id)
+                    self.tracker.clean_old_tracks(active_ids)
+                    still_in_tracker = set(self.tracker.track_history.keys())
+                    all_cached = list(self._last_person_results.keys())
+                    for lost_tid in all_cached:
+                        if lost_tid not in still_in_tracker:
+                            self.recognizer._clear_state(lost_tid)
+                            self._last_person_results.pop(lost_tid, None)
 
-                    if result['detected'] and result['risk_level'] == 'high':
-                        now   = time.time()
-                        count = self.alert_count.get(track_id, 0)
-                        # Chup anh moi 5s, toi da 3 lan — lan thu 3 gui len DB
-                        if count < 3 and (now - self.last_alert_time.get(track_id, 0)) >= 5:
-                            cnt = count + 1
-                            self._total_alerts += 1
-                            self.alert_count[track_id]     = cnt
-                            self.last_alert_time[track_id] = now
-                            self.after(0, lambda c=cnt, s=result['symptom']:
-                                       self.log_msg(f"🚨 CẢNH BÁO [{c}/3]: {s}"))
-                            self.after(0, lambda:
-                                       self.lbl_alerts.configure(
-                                           text=f"Cảnh báo: {self._total_alerts}"))
-                            frame_copy = frame.copy()
-                            self._upload_pool.submit(
-                                self._async_upload, frame_copy, track_id, result, cnt)
-                    # Lưu kết quả vào cache riêng per-track (không lưu trong res dict)
-                    self._last_person_results[track_id] = result
-                else:
-                    # Frame skip: lấy kết quả cache của từng người riêng biệt
-                    # → mỗi track_id có kết quả độc lập, không bị ghi đè bởi người khác
-                    result = self._last_person_results.get(
-                        track_id, self.recognizer._result(False, 0.0, 'Normal', 'low'))
-
-                frame = draw_skeleton(frame, kpts)
-                frame = draw_info(frame, track_id, bbox, result)
-
-            if run_inference:
-                self.tracker.clean_old_tracks(active_ids)
-                # Dọn state recognizer CHỈ KHI Tracker đã thực sự xóa track
-                # (sau grace period _GRACE_FRAMES=15 frame vắng mặt).
-                # KHÔNG xóa ngay khi YOLO bỏ sót 1-2 frame — như vậy
-                # history vẫn được giữ nguyên và nhận diện không bị chập chờn.
-                still_in_tracker = set(self.tracker.track_history.keys())
-                all_cached = list(self._last_person_results.keys())
-                for lost_tid in all_cached:
-                    if lost_tid not in still_in_tracker:
-                        self.recognizer._clear_state(lost_tid)
-                        self._last_person_results.pop(lost_tid, None)
-
-            # ── Airport detection (mỗi lần obj_ran) ──────────
-            weapon_alerts = []
-            if obj_ran:
-                baggage_alerts = self.baggage_tracker.update(obj_results, results)
-                for alert in baggage_alerts:
-                    self._airport_alerts += 1
-                    self.after(0, lambda a=alert:
-                               self.log_msg(
-                                   f"📄 HÀNH LÝ BỎ LẠI: "
-                                   f"{a['object_class']} ({a['duration_sec']:.0f}s)"))
-                    self._upload_pool.submit(
-                        self._async_airport_upload, frame.copy(), alert)
-
-                weapon_alerts = self.weapon_detector.detect_frame(
-                    obj_results, results, camera_id=self.camera_id)
-
-                for alert in weapon_alerts:
-                    self._airport_alerts += 1
-                    self.after(0, lambda a=alert:
-                               self.log_msg(
-                                   f"WEAPON: "
-                                   f"{a['object_class']} conf={a['confidence']:.0%}"))
-                    self._upload_pool.submit(
-                        self._async_airport_upload, frame.copy(), alert)
-
-            else:
-                # Frame skip: vẫn chạy detect_frame với cache để cập nhật active_detections
-                self.weapon_detector.detect_frame(
-                    self._last_obj_results, results, camera_id=self.camera_id)
-
-                # Periodic DB sync
-                self._db_sync_counter += 1
-                if self._db_sync_counter >= self.DB_SYNC_EVERY:
-                    self._db_sync_counter = 0
-                    dirty = self.baggage_tracker.pop_dirty()
-                    if dirty:
+                # ── Airport detection (moi lan obj_ran) ──────────
+                weapon_alerts = []
+                if obj_ran:
+                    baggage_alerts = self.baggage_tracker.update(obj_results, results)
+                    for alert in baggage_alerts:
+                        self._airport_alerts += 1
+                        self.after(0, lambda a=alert:
+                                   self.log_msg(
+                                       f"\U0001f4c4 HANH LY BO LAI: "
+                                       f"{a['object_class']} ({a['duration_sec']:.0f}s)"))
                         self._upload_pool.submit(
-                            self.airport_cloud.upsert_baggage_tracks, dirty)
-                    active_bag_ids = list(self.baggage_tracker.get_all_states().keys())
-                    self._upload_pool.submit(
-                        self.airport_cloud.clean_baggage_tracks, active_bag_ids)
+                            self._async_airport_upload, frame.copy(), alert)
 
-                states    = self.baggage_tracker.get_all_states()
-                n_bags    = len(states)
-                n_abandon = sum(1 for s in states.values() if s.alerted)
-                n_w       = len(self.weapon_detector.get_active_overlays())
-                self.after(0, lambda b=n_bags, a=n_abandon, w=n_w:
-                           self.lbl_airport.configure(
-                               text=f"Hành lý: {b} (!{a})  Vật thể: {w}"))
+                    weapon_alerts = self.weapon_detector.detect_frame(
+                        obj_results, results, camera_id=self.camera_id)
 
-            # ── Airport visualization ─────────────────────────
-            states = self.baggage_tracker.get_all_states()
-            frame  = draw_baggage_overlays(frame, states, abandon_timeout=self.baggage_tracker.timeout)
+                    for alert in weapon_alerts:
+                        self._airport_alerts += 1
+                        self.after(0, lambda a=alert:
+                                   self.log_msg(
+                                       f"WEAPON: "
+                                       f"{a['object_class']} conf={a['confidence']:.0%}"))
+                        self._upload_pool.submit(
+                            self._async_airport_upload, frame.copy(), alert)
 
-            # Overlay vũ khí liên tục: lấy từ persistent state, không phụ thuộc cooldown
-            active_weapons = self.weapon_detector.get_active_overlays()
-            if active_weapons:
-                frame = draw_weapon_alerts(frame, active_weapons)
+                else:
+                    self.weapon_detector.detect_frame(
+                        self._last_obj_results, results, camera_id=self.camera_id)
 
-            n_w_hud = len(active_weapons)
-            frame = draw_airport_stats(
-                frame, len(states),
-                sum(1 for s in states.values() if s.alerted),
-                n_w_hud)
+                    self._db_sync_counter += 1
+                    if self._db_sync_counter >= self.DB_SYNC_EVERY:
+                        self._db_sync_counter = 0
+                        dirty = self.baggage_tracker.pop_dirty()
+                        if dirty:
+                            self._upload_pool.submit(
+                                self.airport_cloud.upsert_baggage_tracks, dirty)
+                        active_bag_ids = list(self.baggage_tracker.get_all_states().keys())
+                        self._upload_pool.submit(
+                            self.airport_cloud.clean_baggage_tracks, active_bag_ids)
 
-            frame = draw_fps(frame, self.fps)
+                    states    = self.baggage_tracker.get_all_states()
+                    n_bags    = len(states)
+                    n_abandon = sum(1 for s in states.values() if s.alerted)
+                    n_w       = len(self.weapon_detector.get_active_overlays())
+                    self.after(0, lambda b=n_bags, a=n_abandon, w=n_w:
+                               self.lbl_airport.configure(
+                                   text=f"Hanh ly: {b} (!{a})  Vat the: {w}"))
 
-            curr_time = time.time()
-            self.fps  = 1.0 / (curr_time - prev_time + 1e-9)
-            prev_time = curr_time
+                # ── Airport visualization ─────────────────────────
+                states = self.baggage_tracker.get_all_states()
+                frame  = draw_baggage_overlays(frame, states, abandon_timeout=self.baggage_tracker.timeout)
 
-            # Adaptive Frame Skip logic (mỗi 30 frames)
-            if self.adaptive_mode:
-                self._adaptive_counter += 1
-                if self._adaptive_counter >= 30:
-                    self._adaptive_counter = 0
-                    if self.fps < 18:
-                        # FPS quá thấp → Tăng skip để giảm tải GPU
-                        old_skip = self.FRAME_SKIP
-                        self.FRAME_SKIP = min(4, self.FRAME_SKIP + 1)
-                        self.obj_detector.object_skip = min(6, self.obj_detector.object_skip + 1)
-                        if self.FRAME_SKIP != old_skip:
-                            self.after(0, lambda s=self.FRAME_SKIP: (
-                                self.lbl_skip.configure(text=f"Skip={s} (Auto)"),
-                                self.skip_slider.set(s)
-                            ))
-                    elif self.fps > 26 and self.FRAME_SKIP > 1:
-                        # FPS dư dả → Giảm skip để nhận diện mượt hơn
-                        old_skip = self.FRAME_SKIP
-                        self.FRAME_SKIP = max(1, self.FRAME_SKIP - 1)
-                        self.obj_detector.object_skip = max(3, self.obj_detector.object_skip - 1)
-                        if self.FRAME_SKIP != old_skip:
-                            self.after(0, lambda s=self.FRAME_SKIP: (
-                                self.lbl_skip.configure(text=f"Skip={s} (Auto)"),
-                                self.skip_slider.set(s)
-                            ))
+                active_weapons = self.weapon_detector.get_active_overlays()
+                if active_weapons:
+                    frame = draw_weapon_alerts(frame, active_weapons)
 
-            if run_inference:
-                n_persons = len(results)
-                # Hiển thị FPS kèm chế độ adaptive
-                mode_str = " (Auto)" if self.adaptive_mode else " (Manual)"
-                self.after(0, lambda f=self.fps, n=n_persons, m=mode_str: (
-                    self.lbl_fps.configure(text=f"FPS: {f:.1f}"),
-                    self.lbl_persons.configure(text=f"Người: {n}"),
-                    self.lbl_skip.configure(text=f"Skip={self.FRAME_SKIP}{m}")
-                ))
+                n_w_hud = len(active_weapons)
+                frame = draw_airport_stats(
+                    frame, len(states),
+                    sum(1 for s in states.values() if s.alerted),
+                    n_w_hud)
 
-            if not self.frame_queue.full():
-                self.frame_queue.put(frame)
+                frame = draw_fps(frame, self.fps)
+
+                curr_time = time.time()
+                self.fps  = 1.0 / (curr_time - prev_time + 1e-9)
+                prev_time = curr_time
+
+                # Adaptive Frame Skip logic (moi 30 frames)
+                if self.adaptive_mode:
+                    self._adaptive_counter += 1
+                    if self._adaptive_counter >= 30:
+                        self._adaptive_counter = 0
+                        if self.fps < 18:
+                            old_skip = self.FRAME_SKIP
+                            self.FRAME_SKIP = min(4, self.FRAME_SKIP + 1)
+                            self.obj_detector.object_skip = min(6, self.obj_detector.object_skip + 1)
+                            if self.FRAME_SKIP != old_skip:
+                                self.after(0, lambda s=self.FRAME_SKIP: (
+                                    self.lbl_skip.configure(text=f"Skip={s} (Auto)"),
+                                    self.skip_slider.set(s)
+                                ))
+                        elif self.fps > 26 and self.FRAME_SKIP > 1:
+                            old_skip = self.FRAME_SKIP
+                            self.FRAME_SKIP = max(1, self.FRAME_SKIP - 1)
+                            self.obj_detector.object_skip = max(3, self.obj_detector.object_skip - 1)
+                            if self.FRAME_SKIP != old_skip:
+                                self.after(0, lambda s=self.FRAME_SKIP: (
+                                    self.lbl_skip.configure(text=f"Skip={s} (Auto)"),
+                                    self.skip_slider.set(s)
+                                ))
+
+                if run_inference:
+                    n_persons = len(results)
+                    mode_str = " (Auto)" if self.adaptive_mode else " (Manual)"
+                    self.after(0, lambda f=self.fps, n=n_persons, m=mode_str: (
+                        self.lbl_fps.configure(text=f"FPS: {f:.1f}"),
+                        self.lbl_persons.configure(text=f"Nguoi: {n}"),
+                        self.lbl_skip.configure(text=f"Skip={self.FRAME_SKIP}{m}")
+                    ))
+
+                if not self.frame_queue.full():
+                    self.frame_queue.put(frame)
 
 
-        cap.release()
-
+        except Exception as e:
+            print(f"[VideoWorker] Exception: {e}")
+            self.after(0, lambda err=str(e): self.log_msg(f"[ERROR] Camera stream: {err}"))
+        finally:
+            # S12: Luon giai phong camera, ke ca khi co exception
+            cap.release()
+            self.is_running = False
+            self.after(0, lambda: self.start_btn.configure(
+                text="▶  BAT DAU", fg_color="#16a34a", hover_color="#15803d"
+            ))
 
 
     # ── UI render loop ─────────────────────────────────────────
