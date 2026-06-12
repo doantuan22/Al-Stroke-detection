@@ -12,7 +12,7 @@ _TRACKER_CFG = str(Path(__file__).parents[2] / 'bytetrack_stroke.yaml')
 
 
 class PoseDetector:
-    def __init__(self, model_path='yolov8n-pose.pt', device=None, input_size=640):
+    def __init__(self, model_path='yolov8n-pose.pt', device=None, input_size=640, tracker_cfg=_TRACKER_CFG):
         """
         Initialize YOLOv8-Pose detector with optimized settings.
         Args:
@@ -27,6 +27,7 @@ class PoseDetector:
 
         self.input_size = input_size
         self.use_half   = (self.device == 'cuda')   # FP16 only on GPU
+        self.tracker_cfg = tracker_cfg
 
         print(f"[AI Engine] Loading {model_path} on {self.device}...")
         self.model = YOLO(model_path)
@@ -77,7 +78,7 @@ class PoseDetector:
             conf=conf,
             half=self.use_half,
             persist=persist,         # giữ state tracker giữa các frame
-            tracker=_TRACKER_CFG,   # dùng config tùy chỉnh track_buffer=60
+            tracker=self.tracker_cfg,
             verbose=False,
             device=self.device,
         )

@@ -53,6 +53,8 @@ class WeaponDetector:
         conf: float          = WEAPON_CONF_MIN,
         bearer_radius: float = BEARER_RADIUS_PX,
         cooldown: float      = ALERT_COOLDOWN,
+        wrist_distance_threshold: float = 80.0,
+        pose_confidence_boost: float = 0.15,
     ):
         """
         Args:
@@ -67,6 +69,8 @@ class WeaponDetector:
         self.conf          = conf
         self.bearer_radius = bearer_radius
         self.cooldown      = cooldown
+        self.wrist_distance_threshold = wrist_distance_threshold
+        self.pose_confidence_boost = pose_confidence_boost
 
         # Map class IDs theo model đang dùng
         self.weapon_classes = (
@@ -141,7 +145,11 @@ class WeaponDetector:
             seen_keys.add(loc_key)
 
             # Xác định bearer (người đang cầm)
-            bearer_id = self._find_bearer(cx, cy, persons)
+            bearer_id, hand_distance, pose_associated = self._find_bearer_details(cx, cy, persons)
+            adjusted_conf = min(
+                1.0,
+                conf_val + (self.pose_confidence_boost if pose_associated else 0.0)
+            )
 
             # Risk level
             risk = 'critical' if zone_name else 'high'
@@ -150,8 +158,9 @@ class WeaponDetector:
             self._active_detections[loc_key] = {
                 'bbox'        : bbox,
                 'class_name'  : class_name,
-                'conf'        : conf_val,
+                'conf'        : adjusted_conf,
                 'bearer_id'   : bearer_id,
+                'hand_distance': hand_distance,
                 'risk_level'  : risk,
                 'zone_name'   : zone_name,
                 'camera_id'   : camera_id,
@@ -168,12 +177,14 @@ class WeaponDetector:
                 'track_id'    : bearer_id,
                 'object_class': class_name,
                 'bbox'        : bbox,
-                'confidence'  : conf_val,
+                'confidence'  : adjusted_conf,
                 'risk_level'  : risk,
                 'zone_name'   : zone_name,
                 'camera_id'   : camera_id,
                 'duration_sec': 0.0,
                 'bearer_id'   : bearer_id,
+                'hand_distance': hand_distance,
+                'pose_associated': pose_associated,
             })
 
         # Dọn các detection không còn nhìn thấy lâu hơn OVERLAY_PERSIST giây
@@ -223,6 +234,46 @@ class WeaponDetector:
                 best_dist = d
                 best_id   = p.get('track_id')
         return best_id
+
+    def _find_bearer_details(
+        self, cx: float, cy: float, persons: list[dict]
+    ) -> tuple[Optional[int], Optional[float], bool]:
+        best_dist = float('inf')
+        best_id = None
+        best_hand_distance = None
+        best_pose_associated = False
+
+        for p in persons:
+            pb = p.get('bbox') or []
+            if len(pb) < 4:
+                continue
+            px = (pb[0] + pb[2]) / 2
+            py = (pb[1] + pb[3]) / 2
+            d = np.hypot(cx - px, cy - py)
+            if d < self.bearer_radius and d < best_dist:
+                best_dist = d
+                best_id = p.get('track_id')
+                best_hand_distance, best_pose_associated = self._closest_hand_distance(cx, cy, p)
+
+        return best_id, best_hand_distance, best_pose_associated
+
+    def _closest_hand_distance(self, cx: float, cy: float, person: dict) -> tuple[Optional[float], bool]:
+        kpts = person.get('kpts')
+        if kpts is None:
+            return None, False
+
+        best = float('inf')
+        for idx in (7, 8, 9, 10):
+            if len(kpts) <= idx:
+                continue
+            kp = kpts[idx]
+            if len(kp) < 3 or kp[2] < 0.25:
+                continue
+            best = min(best, float(np.hypot(cx - kp[0], cy - kp[1])))
+
+        if best == float('inf'):
+            return None, False
+        return best, best <= self.wrist_distance_threshold
 
     def get_class_ids(self) -> list[int]:
         """Trả về danh sách class IDs đang theo dõi."""

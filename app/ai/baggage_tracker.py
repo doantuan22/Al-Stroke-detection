@@ -5,6 +5,7 @@ Phát hiện hành lý (túi, vali, balo) bị bỏ lại không có chủ.
 """
 import time
 import numpy as np
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -30,6 +31,12 @@ class BaggageState:
     alert_count  : int     = 0
     alerted      : bool    = False
     db_synced    : bool    = False
+    likely_owner_id: Optional[int] = None
+    stationary_since: Optional[float] = None
+    center_velocity: float = 0.0
+    risk_score: float = 0.0
+    owner_scores: dict[int, float] = field(default_factory=dict)
+    center_history: deque = field(default_factory=lambda: deque(maxlen=20))
     # Trạng thái chủ hành lý frame trước (để phát hiện transition)
     _prev_has_owner: bool  = True   # Giả sử ban đầu có chủ để tránh false alarm ngay lúc xuất hiện
 
@@ -98,13 +105,23 @@ class AbandonedBaggageTracker:
         camera_id     : str   = 'CAM_00',
         grace_period  : float = 3.0,
         owner_presence_grace_period: float = 2.0,
+        config: dict | None = None,
     ):
+        cfg = (config or {}).get('baggage', {})
         self.owner_radius = owner_radius
         self.timeout      = timeout
         self.cooldown     = cooldown
         self.camera_id    = camera_id
         self.grace_period = grace_period
         self.owner_presence_grace_period = owner_presence_grace_period
+        self.confidence_threshold = float(cfg.get('confidence_threshold', 0.22))
+        self.proximity_expand = float(cfg.get('proximity_expand_px', PROXIMITY_EXPAND))
+        self.stationary_velocity_threshold = float(cfg.get('stationary_velocity_threshold', 2.0))
+        self.stationary_duration = float(cfg.get('stationary_duration_sec', 3.0))
+        self.owner_leave_distance_threshold = float(cfg.get('owner_leave_distance_threshold', 120.0))
+        self.risk_alert_threshold = float(cfg.get('risk_alert_threshold', 0.75))
+        self.risk_weights = cfg.get('risk', {})
+        self.zone_timeouts = (config or {}).get('zones', {})
 
         self._states   : dict[int, BaggageState] = {}
 
@@ -116,6 +133,7 @@ class AbandonedBaggageTracker:
         self,
         objects : list[dict],
         persons : list[dict],
+        zone_name: str | None = None,
     ) -> list[dict]:
         """
         Cập nhật tracker với detection mới nhất.
@@ -140,7 +158,7 @@ class AbandonedBaggageTracker:
             o for o in objects
             if o.get('class_id') in BAGGAGE_CLASS_IDS
             and o.get('bbox') and len(o.get('bbox', [])) >= 4
-            and o.get('conf', 0) >= 0.22
+            and o.get('conf', 0) >= self.confidence_threshold
         ]
 
         # Áp dụng NMS tránh các box hành lý trùng nhau của YOLO (backpack vs handbag vs suitcase)
@@ -157,6 +175,7 @@ class AbandonedBaggageTracker:
         bags = keep_bags
 
         active_bag_ids = {b['track_id'] for b in bags}
+        person_features = self._prepare_person_features(persons)
 
         # 1. Khắc phục chuyển ID (tracker switching): Nếu một state cũ (đang chờ grace period) 
         # bị trùng lấp vị trí với một bag mới hoạt động, ta kế thừa state cũ cho ID mới để giữ nguyên bộ đếm thời gian.
@@ -207,9 +226,11 @@ class AbandonedBaggageTracker:
             # Tâm của hành lý
             cx = (bbox[0] + bbox[2]) / 2
             cy = (bbox[1] + bbox[3]) / 2
+            self._update_motion_state(state, cx, cy, now)
+            self._update_owner_scores(state, cx, cy, person_features, now)
 
             # ── Kiểm tra owner ──────────────────────────────
-            has_owner = self._has_nearby_person(cx, cy, bbox, persons)
+            has_owner = self._has_nearby_person(cx, cy, bbox, person_features)
 
             # Phat hien transition owner
             if state._prev_has_owner and not has_owner:
@@ -252,7 +273,9 @@ class AbandonedBaggageTracker:
 
             # ── Kiểm tra alert ────────────────────────────────
             # BUG FIX: dùng self.timeout thay vì is_suspicious (vốn dùng constant)
-            if state.abandon_seconds >= self.timeout:
+            timeout = self._timeout_for_zone(zone_name)
+            state.risk_score = self._calculate_risk(state, has_owner, timeout)
+            if state.abandon_seconds >= timeout and state.risk_score >= self.risk_alert_threshold:
                 can_alert = (now - state.last_alert_at) >= self.cooldown
                 if can_alert:
                     state.last_alert_at = now
@@ -267,9 +290,12 @@ class AbandonedBaggageTracker:
                         'bbox'        : bbox,
                         'duration_sec': state.abandon_seconds,
                         'confidence'  : float(bag.get('conf', 0.75)),
-                        'risk_level'  : 'high',
+                        'risk_level'  : self._risk_level(state.risk_score, zone_name),
                         'camera_id'   : self.camera_id,
-                        'zone_name'   : None,
+                        'zone_name'   : zone_name,
+                        'risk_score'  : state.risk_score,
+                        'likely_owner_id': state.likely_owner_id,
+                        'stationary'  : self._is_stationary(state),
                     })
 
         return alerts
@@ -291,6 +317,23 @@ class AbandonedBaggageTracker:
             s.camera_id = camera_id
 
     # ── INTERNAL ───────────────────────────────────────────────
+    def _prepare_person_features(self, persons: list[dict]) -> list[dict]:
+        features = []
+        for p in persons:
+            if p.get('conf', 0) < 0.35:
+                continue
+            pb = p.get('bbox') or []
+            if len(pb) < 4:
+                continue
+            px1, py1, px2, py2 = pb[:4]
+            features.append({
+                'track_id': p.get('track_id'),
+                'bbox': (px1, py1, px2, py2),
+                'cx': (px1 + px2) * 0.5,
+                'cy': (py1 + py2) * 0.5,
+            })
+        return features
+
     def _has_nearby_person(
         self, cx: float, cy: float, bag_bbox: list, persons: list[dict]
     ) -> bool:
@@ -304,23 +347,19 @@ class AbandonedBaggageTracker:
         """
         bx1, by1, bx2, by2 = bag_bbox[:4]
         # Mở rộng bbox hành lý theo 4 hướng
-        ex1 = bx1 - PROXIMITY_EXPAND
-        ey1 = by1 - PROXIMITY_EXPAND
-        ex2 = bx2 + PROXIMITY_EXPAND
-        ey2 = by2 + PROXIMITY_EXPAND
+        ex1 = bx1 - self.proximity_expand
+        ey1 = by1 - self.proximity_expand
+        ex2 = bx2 + self.proximity_expand
+        ey2 = by2 + self.proximity_expand
 
+        owner_radius_sq = self.owner_radius * self.owner_radius
         for p in persons:
-            if p.get('conf', 0) < 0.35:
-                continue
-            pb = p.get('bbox', [])
-            if len(pb) < 4:
-                continue
-            px1, py1, px2, py2 = pb[:4]
-            pcx = (px1 + px2) / 2
-            pcy = (py1 + py2) / 2
+            px1, py1, px2, py2 = p['bbox']
+            dx = cx - p['cx']
+            dy = cy - p['cy']
 
             # Phương pháp 1: center-to-center distance
-            if np.hypot(cx - pcx, cy - pcy) <= self.owner_radius:
+            if dx * dx + dy * dy <= owner_radius_sq:
                 return True
 
             # Phương pháp 2: expanded bag bbox overlap với person bbox
@@ -328,4 +367,80 @@ class AbandonedBaggageTracker:
                 return True
 
         return False
+
+    def _update_motion_state(self, state: BaggageState, cx: float, cy: float, now: float):
+        if state.center_history:
+            prev_t, px, py = state.center_history[-1]
+            dt = max(now - prev_t, 1e-6)
+            state.center_velocity = float(np.hypot(cx - px, cy - py) / dt)
+        state.center_history.append((now, cx, cy))
+
+        if state.center_velocity <= self.stationary_velocity_threshold:
+            if state.stationary_since is None:
+                state.stationary_since = now
+        else:
+            state.stationary_since = None
+
+    def _update_owner_scores(self, state: BaggageState, cx: float, cy: float, persons: list[dict], now: float):
+        owner_radius_sq = self.owner_radius * self.owner_radius
+        leave_distance_sq = self.owner_leave_distance_threshold * self.owner_leave_distance_threshold
+        for p in persons:
+            tid = p.get('track_id')
+            if tid is None:
+                continue
+            dx = cx - p['cx']
+            dy = cy - p['cy']
+            dist_sq = dx * dx + dy * dy
+            near_bonus = 1.0 if dist_sq <= owner_radius_sq else 0.0
+            leave_penalty = 0.35 if dist_sq > leave_distance_sq else 0.0
+            state.owner_scores[tid] = max(
+                0.0, state.owner_scores.get(tid, 0.0) + near_bonus - leave_penalty
+            )
+
+        if state.owner_scores:
+            state.likely_owner_id = max(state.owner_scores, key=state.owner_scores.get)
+
+    def _is_stationary(self, state: BaggageState) -> bool:
+        return (
+            state.stationary_since is not None
+            and time.time() - state.stationary_since >= self.stationary_duration
+        )
+
+    def _timeout_for_zone(self, zone_name: str | None) -> float:
+        if zone_name and zone_name in self.zone_timeouts:
+            return float(self.zone_timeouts[zone_name].get('baggage_timeout_sec', self.timeout))
+        default_zone = self.zone_timeouts.get('default', {})
+        return float(default_zone.get('baggage_timeout_sec', self.timeout))
+
+    def _calculate_risk(self, state: BaggageState, has_owner: bool, timeout: float) -> float:
+        weights = {
+            'stationary_weight': 0.20,
+            'owner_left_weight': 0.30,
+            'no_nearby_person_weight': 0.20,
+            'timeout_weight': 0.30,
+            'leave_distance_weight': 0.15,
+        }
+        weights.update(self.risk_weights or {})
+        risk = 0.0
+        if self._is_stationary(state):
+            risk += float(weights['stationary_weight'])
+        if state.owner_gone_at is not None:
+            risk += float(weights['owner_left_weight'])
+            if state.abandon_seconds >= timeout:
+                risk += float(weights['timeout_weight'])
+        if not has_owner:
+            risk += float(weights['no_nearby_person_weight'])
+        if state.likely_owner_id is not None and state.owner_gone_at is not None:
+            risk += float(weights['leave_distance_weight'])
+        return min(1.0, risk)
+
+    @staticmethod
+    def _risk_level(score: float, zone_name: str | None = None) -> str:
+        if zone_name == 'security_checkpoint' and score >= 0.75:
+            return 'critical'
+        if score >= 0.75:
+            return 'high'
+        if score >= 0.5:
+            return 'medium'
+        return 'low'
 

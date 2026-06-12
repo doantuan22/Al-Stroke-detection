@@ -2,12 +2,12 @@
 AI Safety Dashboard v4 — Stroke + Airport Security
 - Multi-threaded GPU detection with ByteTrack
 - Async cloud upload (no pipeline blocking)
-- ObjectDetector chạy mỗi 3 frames (tiết kiệm GPU)
+- 1080p camera profile: pose 768px, object/weapon 960px, adaptive skip
 - Abandoned Baggage + Weapon Detection
 """
 import cv2
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, font as tkfont
 import customtkinter as ctk
 from PIL import Image, ImageTk
 import time
@@ -18,21 +18,41 @@ from io import BytesIO
 from pathlib import Path
 from queue import Queue
 from datetime import datetime
+from app.config import ConfigLoader
+from app.engine.safety_engine import SafetyEngine
+from app.alerts.manager import AlertManager
+from app.pipeline.video_pipeline import VideoPipeline
+from app.cloud.cloud_sync import CloudSync
+from app.gui.ui_controller import UIController
 
-# AI Engine — Stroke
-from app.ai.detector import PoseDetector
-from app.ai.tracker import Tracker
-from app.ai.recognizer_v2 import StrokeRecognizerV2, StrokeConfig
-# AI Engine — Airport
-from app.ai.object_detector import ObjectDetector, BAGGAGE_CLASS_IDS
-from app.ai.baggage_tracker import AbandonedBaggageTracker
-from app.ai.weapon_detector import WeaponDetector
 # Cloud
 from app.cloud.supabase import SupabaseClient
 from app.cloud.airport_cloud import AirportCloudClient
 # Visualization
 from app.utils.visualization import draw_info, draw_skeleton, draw_fps
 from app.utils.airport_viz import draw_baggage_overlays, draw_weapon_alerts, draw_airport_stats
+
+
+UI_FONT_FAMILY = "Segoe UI"
+
+
+def configure_vietnamese_fonts(root):
+    """Use a Windows font with full Vietnamese glyph coverage for Tk/CTk widgets."""
+    try:
+        ctk.ThemeManager.theme["CTkFont"]["family"] = UI_FONT_FAMILY
+    except Exception:
+        pass
+
+    root.option_add("*Font", f"{{{UI_FONT_FAMILY}}} 10")
+    for font_name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
+        try:
+            tkfont.nametofont(font_name).configure(family=UI_FONT_FAMILY)
+        except Exception:
+            pass
+
+    style = ttk.Style(root)
+    style.configure("Treeview", font=(UI_FONT_FAMILY, 10), rowheight=28)
+    style.configure("Treeview.Heading", font=(UI_FONT_FAMILY, 10, "bold"))
 
 
 # ══════════════════════════════════════════════════════════════
@@ -574,6 +594,7 @@ class StrokeApp(ctk.CTk):
         self.title("Hệ thống nhận diện nguy hiểm bằng AI")
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
+        configure_vietnamese_fonts(self)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # ── Responsive window: mở rộng tối đa ngay khi khởi động ──
@@ -594,20 +615,18 @@ class StrokeApp(ctk.CTk):
         self._log_h = 90 if sh < 800 else 120
 
         # ── Stroke Engines ────────────────────────────────────
-        self.detector   = PoseDetector(input_size=640)
-        self.tracker    = Tracker(max_history=30)
-        self.recognizer = StrokeRecognizerV2(debug=False)  # v2 with improved detection
+        self.config = ConfigLoader().data
+        self.video_pipeline = VideoPipeline(self.config)
+        self.alert_manager = AlertManager(self.config)
+        self.engine = SafetyEngine(self.config, camera_id='CAM_00')
+        self.detector = self.engine.detector
+        self.tracker = self.engine.tracker
+        self.recognizer = self.engine.recognizer
 
         # ── Airport Engines ───────────────────────────────────
-        self.obj_detector    = ObjectDetector(model_path='yolov8n.pt', object_skip=3)
-        self.baggage_tracker = AbandonedBaggageTracker(camera_id='CAM_00')
-        self.weapon_detector = WeaponDetector(
-            self.obj_detector,
-            conf=0.15,          # ngưỡng thấp để nhận dao dễ hơn
-            bearer_radius=200,  # tăng rá dò để bắt tốt hơn
-            cooldown=5.0,       # upload mỗi 5 giây
-        )
-
+        self.obj_detector = self.engine.obj_detector
+        self.baggage_tracker = self.engine.baggage_tracker
+        self.weapon_detector = self.engine.weapon_detector
         # ── Cloud ─────────────────────────────────────────────
         self.cloud         = SupabaseClient()       # stroke_events
         self.airport_cloud = AirportCloudClient()   # airport_events
@@ -619,13 +638,14 @@ class StrokeApp(ctk.CTk):
         self._upload_pool     = ThreadPoolExecutor(max_workers=3, thread_name_prefix="cloud")
 
         # ── Frame counters ────────────────────────────────────
-        self.FRAME_SKIP      = 2
+        inf_cfg = self.config.get("inference", {})
+        self.FRAME_SKIP      = int(inf_cfg.get("pose_skip_default", 2))
         self._frame_counter  = 0
         self._last_results   = []
         self._last_obj_results = []   # cache object detection
         # DB sync throttle: upsert baggage_tracks mỗi 90 frames
         self._db_sync_counter = 0
-        self.DB_SYNC_EVERY    = 90
+        self.DB_SYNC_EVERY    = int(inf_cfg.get("db_sync_every_frames", 90))
         self.adaptive_mode    = True  # Tự động điều chỉnh frame skip để giữ FPS ổn định
         self._adaptive_counter = 0
 
@@ -645,6 +665,13 @@ class StrokeApp(ctk.CTk):
         # Không cần _weapon_flash state nữa — overlay là liên tục
 
         self._create_widgets()
+        self.ui = UIController(self)
+        self.cloud_sync = CloudSync(
+            self.cloud,
+            self.airport_cloud,
+            baggage_tracker=self.baggage_tracker,
+            log=lambda msg: self.after(0, lambda m=msg: self.log_msg(m)),
+        )
 
     # ── Layout ────────────────────────────────────────────────
     def _create_widgets(self):
@@ -850,7 +877,7 @@ class StrokeApp(ctk.CTk):
             self.source = int(value.split()[-1])
             self.camera_id = f"CAM_{self.source:02d}"
         # Cập nhật camera_id cho airport engines
-        self.baggage_tracker.update_camera(self.camera_id)
+        self.engine.update_camera(self.camera_id)
         self.log_msg(f"Nguồn: {self.source} | ID: {self.camera_id}")
 
 
@@ -872,21 +899,17 @@ class StrokeApp(ctk.CTk):
     # ── Async cloud upload (Stroke) ─────────────────────────────
     def _async_upload(self, frame_copy, track_id, result, current_count):
         """Stroke events — chạy trong thread pool, không block pipeline."""
-        local_path = self.cloud.save_local(frame_copy, track_id, result)
-        if local_path:
-            self.after(0, lambda p=local_path: self.log_msg(f"💾 Lưu local: {p}"))
-        if current_count == 3:
-            url, _ = self.cloud.upload_alert(frame_copy, track_id, result,
-                                              camera_id=self.camera_id)
+        if self.alert_manager.should_upload_stroke(current_count):
+            url, _ = self.cloud_sync.upload_stroke(
+                frame_copy, track_id, result, camera_id=self.camera_id)
             if url:
                 self.after(0, lambda: self.log_msg("☁ Stroke cloud sync!"))
 
     # ── Async cloud upload (Airport) ────────────────────────────
     def _async_airport_upload(self, frame_copy, alert: dict):
         """Airport alert — upload ảnh + insert airport_events."""
-        url, path = self.airport_cloud.upload_airport_alert(
-            frame_copy, alert, camera_id=self.camera_id
-        )
+        url, path = self.cloud_sync.upload_airport(
+            frame_copy, alert, camera_id=self.camera_id)
         if url:
             etype = alert.get('event_type', '')
             emoji = "🗃" if 'baggage' in etype else "⚔️"
@@ -894,26 +917,32 @@ class StrokeApp(ctk.CTk):
                 f"{emoji} Airport alert ↑ Supabase: {alert.get('object_class')}"
             ))
         # Upsert baggage_tracks realtime (dirty states)
-        dirty = self.baggage_tracker.pop_dirty()
-        if dirty:
-            self.airport_cloud.upsert_baggage_tracks(dirty)
+        self.cloud_sync.sync_baggage_tracks()
 
 
     # ── AI worker thread ───────────────────────────────────────
     def _video_worker(self):
 
-        cap = cv2.VideoCapture(self.source)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap = self.video_pipeline.open(self.source)
 
         # S1: Kiểm tra camera có mở được không
         if not cap.isOpened():
             self.is_running = False
             self.after(0, lambda: (
                 self.log_msg(f"[ERROR] Khong mo duoc camera/video: {self.source}"),
-                self.start_btn.configure(text="▶  BAT DAU",
+                self.start_btn.configure(text="▶  BẮT ĐẦU",
                                          fg_color="#16a34a", hover_color="#15803d")
             ))
             return
+
+        actual_w, actual_h, actual_fps = self.video_pipeline.describe(cap)
+        inf_cfg = self.config.get("inference", {})
+        self.after(0, lambda w=actual_w, h=actual_h, f=actual_fps:
+                   self.log_msg(
+                       f"Camera profile: {w}x{h} @ {f:.0f}fps | "
+                       f"pose={inf_cfg.get('pose_input_size')}, "
+                       f"object={inf_cfg.get('object_input_size')}"
+                   ))
 
         prev_time = time.time()
         self.obj_detector.reset_skip_counter()
@@ -924,31 +953,30 @@ class StrokeApp(ctk.CTk):
                 if not ret:
                     break
 
-                # S3: Guard frame None / rong
-                if frame is None or frame.size == 0:
+                frame = self.video_pipeline.preprocess(frame)
+                if frame is None:
                     continue
-
-                # S4: Chuyen grayscale / RGBA ve BGR
-                if frame.ndim == 2:
-                    frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-                elif frame.ndim == 3 and frame.shape[2] == 4:
-                    frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
 
                 self._frame_counter += 1
                 run_inference = (self._frame_counter % self.FRAME_SKIP == 0)
 
                 # ── POSE inference (Stroke) ──────────────────────
+                results = self.engine.track_persons(
+                    frame, run_inference, self._last_results)
                 if run_inference:
-                    results = self.detector.track(frame)
                     self._last_results = results
                 else:
                     results = self._last_results
 
                 # ── OBJECT inference (Airport, moi 3 frames) ────
-                obj_results, obj_ran = self.obj_detector.track(
+                object_classes = (
+                    self.config.get("baggage", {}).get("class_ids", [24, 26, 28])
+                    + self.config.get("weapon", {}).get("coco_class_ids", [43, 76])
+                )
+                obj_results, obj_ran = self.engine.track_objects(
                     frame,
-                    classes=[24, 26, 28, 43, 76],
-                    conf=0.20,
+                    classes=object_classes,
+                    conf=float(self.config.get("baggage", {}).get("confidence_threshold", 0.22)),
                 )
 
                 if obj_ran:
@@ -957,57 +985,35 @@ class StrokeApp(ctk.CTk):
                     obj_results = self._last_obj_results
 
                 # ── Stroke detection loop ─────────────────────────
-                active_ids = []
-                for res in results:
+                analyzed_persons, active_ids = self.engine.analyze_persons(
+                    results, frame.shape, run_inference)
+                for res, result in analyzed_persons:
                     bbox     = res['bbox']
                     kpts     = res['kpts']
                     track_id = res['track_id']
-                    active_ids.append(track_id)
 
-                    if run_inference:
-                        self.tracker.update_history(track_id, kpts)
-                        history = self.tracker.get_history(track_id)
-                        result  = self.recognizer.analyze(
-                            history, (frame.shape[1], frame.shape[0]),
-                            track_id=track_id)
-
-                        if result['detected'] and result['risk_level'] == 'high':
-                            now   = time.time()
-                            count = self.alert_count.get(track_id, 0)
-                            if count < 3 and (now - self.last_alert_time.get(track_id, 0)) >= 5:
-                                cnt = count + 1
-                                self._total_alerts += 1
-                                self.alert_count[track_id]     = cnt
-                                self.last_alert_time[track_id] = now
-                                self.after(0, lambda c=cnt, s=result['symptom']:
-                                           self.log_msg(f"\U0001f6a8 CANH BAO [{c}/3]: {s}"))
-                                self.after(0, lambda:
-                                           self.lbl_alerts.configure(
-                                               text=f"Canh bao: {self._total_alerts}"))
-                                frame_copy = frame.copy()
-                                self._upload_pool.submit(
-                                    self._async_upload, frame_copy, track_id, result, cnt)
-                        self._last_person_results[track_id] = result
-                    else:
-                        result = self._last_person_results.get(
-                            track_id, self.recognizer._result(False, 0.0, 'Normal', 'low'))
+                    if run_inference and result['detected'] and result['risk_level'] == 'high':
+                        decision = self.alert_manager.decide_stroke(
+                            track_id, "critical", frame=frame.copy())
+                        if decision.should_emit:
+                            self._total_alerts += 1
+                            self.after(0, lambda c=decision.count, s=result['symptom']:
+                                       self.log_msg(f"\U0001f6a8 CẢNH BÁO [{c}]: {s}"))
+                            self.after(0, lambda:
+                                       self.lbl_alerts.configure(
+                                           text=f"Canh bao: {self._total_alerts}"))
+                            frame_copy = frame.copy()
+                            self._upload_pool.submit(
+                                self._async_upload, frame_copy, track_id, result, decision.count)
 
                     frame = draw_skeleton(frame, kpts)
                     frame = draw_info(frame, track_id, bbox, result)
 
-                if run_inference:
-                    self.tracker.clean_old_tracks(active_ids)
-                    still_in_tracker = set(self.tracker.track_history.keys())
-                    all_cached = list(self._last_person_results.keys())
-                    for lost_tid in all_cached:
-                        if lost_tid not in still_in_tracker:
-                            self.recognizer._clear_state(lost_tid)
-                            self._last_person_results.pop(lost_tid, None)
-
                 # ── Airport detection (moi lan obj_ran) ──────────
                 weapon_alerts = []
                 if obj_ran:
-                    baggage_alerts = self.baggage_tracker.update(obj_results, results)
+                    baggage_alerts, weapon_alerts = self.engine.detect_airport_events(
+                        obj_results, results, camera_id=self.camera_id)
                     for alert in baggage_alerts:
                         self._airport_alerts += 1
                         self.after(0, lambda a=alert:
@@ -1016,9 +1022,6 @@ class StrokeApp(ctk.CTk):
                                        f"{a['object_class']} ({a['duration_sec']:.0f}s)"))
                         self._upload_pool.submit(
                             self._async_airport_upload, frame.copy(), alert)
-
-                    weapon_alerts = self.weapon_detector.detect_frame(
-                        obj_results, results, camera_id=self.camera_id)
 
                     for alert in weapon_alerts:
                         self._airport_alerts += 1
@@ -1030,19 +1033,17 @@ class StrokeApp(ctk.CTk):
                             self._async_airport_upload, frame.copy(), alert)
 
                 else:
-                    self.weapon_detector.detect_frame(
+                    self.engine.refresh_weapon_overlays(
                         self._last_obj_results, results, camera_id=self.camera_id)
 
                     self._db_sync_counter += 1
                     if self._db_sync_counter >= self.DB_SYNC_EVERY:
                         self._db_sync_counter = 0
-                        dirty = self.baggage_tracker.pop_dirty()
-                        if dirty:
-                            self._upload_pool.submit(
-                                self.airport_cloud.upsert_baggage_tracks, dirty)
+                        self._upload_pool.submit(
+                            self.cloud_sync.sync_baggage_tracks)
                         active_bag_ids = list(self.baggage_tracker.get_all_states().keys())
                         self._upload_pool.submit(
-                            self.airport_cloud.clean_baggage_tracks, active_bag_ids)
+                            self.cloud_sync.clean_baggage_tracks, active_bag_ids)
 
                     states    = self.baggage_tracker.get_all_states()
                     n_bags    = len(states)
@@ -1050,7 +1051,7 @@ class StrokeApp(ctk.CTk):
                     n_w       = len(self.weapon_detector.get_active_overlays())
                     self.after(0, lambda b=n_bags, a=n_abandon, w=n_w:
                                self.lbl_airport.configure(
-                                   text=f"Hanh ly: {b} (!{a})  Vat the: {w}"))
+                                   text=f"Hành lý: {b} (!{a})  Vật thể: {w}"))
 
                 # ── Airport visualization ─────────────────────────
                 states = self.baggage_tracker.get_all_states()
@@ -1077,19 +1078,22 @@ class StrokeApp(ctk.CTk):
                     self._adaptive_counter += 1
                     if self._adaptive_counter >= 30:
                         self._adaptive_counter = 0
-                        if self.fps < 18:
+                        inf_cfg = self.config.get("inference", {})
+                        if self.fps < float(inf_cfg.get("adaptive_fps_low", 20)):
                             old_skip = self.FRAME_SKIP
-                            self.FRAME_SKIP = min(4, self.FRAME_SKIP + 1)
-                            self.obj_detector.object_skip = min(6, self.obj_detector.object_skip + 1)
+                            self.FRAME_SKIP = min(int(inf_cfg.get("pose_skip_max", 4)), self.FRAME_SKIP + 1)
+                            self.obj_detector.object_skip = min(
+                                int(inf_cfg.get("object_skip_max", 6)), self.obj_detector.object_skip + 1)
                             if self.FRAME_SKIP != old_skip:
                                 self.after(0, lambda s=self.FRAME_SKIP: (
                                     self.lbl_skip.configure(text=f"Skip={s} (Auto)"),
                                     self.skip_slider.set(s)
                                 ))
-                        elif self.fps > 26 and self.FRAME_SKIP > 1:
+                        elif self.fps > float(inf_cfg.get("adaptive_fps_high", 28)) and self.FRAME_SKIP > 1:
                             old_skip = self.FRAME_SKIP
                             self.FRAME_SKIP = max(1, self.FRAME_SKIP - 1)
-                            self.obj_detector.object_skip = max(3, self.obj_detector.object_skip - 1)
+                            self.obj_detector.object_skip = max(
+                                int(inf_cfg.get("object_skip_default", 2)), self.obj_detector.object_skip - 1)
                             if self.FRAME_SKIP != old_skip:
                                 self.after(0, lambda s=self.FRAME_SKIP: (
                                     self.lbl_skip.configure(text=f"Skip={s} (Auto)"),
@@ -1101,7 +1105,7 @@ class StrokeApp(ctk.CTk):
                     mode_str = " (Auto)" if self.adaptive_mode else " (Manual)"
                     self.after(0, lambda f=self.fps, n=n_persons, m=mode_str: (
                         self.lbl_fps.configure(text=f"FPS: {f:.1f}"),
-                        self.lbl_persons.configure(text=f"Nguoi: {n}"),
+                        self.lbl_persons.configure(text=f"Người: {n}"),
                         self.lbl_skip.configure(text=f"Skip={self.FRAME_SKIP}{m}")
                     ))
 
@@ -1117,7 +1121,7 @@ class StrokeApp(ctk.CTk):
             cap.release()
             self.is_running = False
             self.after(0, lambda: self.start_btn.configure(
-                text="▶  BAT DAU", fg_color="#16a34a", hover_color="#15803d"
+                text="▶  BẮT ĐẦU", fg_color="#16a34a", hover_color="#15803d"
             ))
 
 

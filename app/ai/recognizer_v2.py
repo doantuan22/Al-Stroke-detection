@@ -80,14 +80,13 @@ class StrokeRecognizerV2:
             self._clear_state(track_id)
             return self._result(False, 0.0, 'Normal', 'low')
         
-        pts = np.array(history)
         w, h = img_size
         
         if track_id not in self._vel_history:
             self._vel_history[track_id] = deque(maxlen=self.config.vel_window)
             self._aspect_history[track_id] = deque(maxlen=self.config.slump_window)
         
-        latest = pts[-1]
+        latest = history[-1]
         valid_mask = (
             (latest[:, 2] > self.config.kpts_conf_min) & 
             (latest[:, 0] > 0) & 
@@ -101,12 +100,12 @@ class StrokeRecognizerV2:
             self._clear_state(track_id)
             return self._result(False, 0.0, 'Normal', 'low')
         
-        hip_y_series = (pts[:, 11, 1] + pts[:, 12, 1]) / 2
-        vel_series = np.diff(hip_y_series)
+        prev = history[-2]
+        prev_hip_y = (prev[11, 1] + prev[12, 1]) * 0.5
+        hip_y = (latest[11, 1] + latest[12, 1]) * 0.5
         
         # Chỉ thêm giá trị CUỐI vào buffer (tránh thêm trùng các frame cũ)
-        if len(vel_series) > 0:
-            self._vel_history[track_id].append(float(vel_series[-1]))
+        self._vel_history[track_id].append(float(hip_y - prev_hip_y))
         
         cur_ar = float(np.ptp(valid[:, 0])) / (float(np.ptp(valid[:, 1])) + 1e-6)
         self._aspect_history[track_id].append(cur_ar)
@@ -116,7 +115,7 @@ class StrokeRecognizerV2:
             self._start_cooldown(track_id, result)
             return result
         
-        result = self._detect_abnormal_posture(track_id, pts, latest, valid, h)
+        result = self._detect_abnormal_posture(track_id, history, latest, valid, h)
         if result['detected']:
             self._start_cooldown(track_id, result)
             return result
@@ -134,7 +133,7 @@ class StrokeRecognizerV2:
         if not vel_buf:
             return self._result(False, 0.0, 'Normal', 'low')
         
-        max_vel = float(np.max(vel_buf))
+        max_vel = float(max(vel_buf))
         threshold = self.config.sudden_vel_ratio * frame_height
         
         if self.debug:
@@ -155,7 +154,7 @@ class StrokeRecognizerV2:
     def _detect_abnormal_posture(
         self, 
         track_id: int, 
-        pts: np.ndarray, 
+        history: list,
         latest: np.ndarray, 
         valid: np.ndarray, 
         frame_height: float
@@ -168,6 +167,9 @@ class StrokeRecognizerV2:
             aspect > self.config.aspect_ratio_min and 
             bbox_h < self.config.bbox_h_max_ratio * frame_height
         )
+        if not cond_horizontal:
+            self._sustained_posture[track_id] = 0
+            return self._result(False, 0.0, 'Normal', 'low')
         
         nose = latest[0]
         l_hip = latest[11]
@@ -188,9 +190,9 @@ class StrokeRecognizerV2:
                 cond_head_low = sho_y > (hip_y - self.config.head_hip_margin * frame_height)
         
         cond_trend = False
-        if len(pts) >= 3:
+        if len(history) >= 3:
             ratios = []
-            for p in pts[-3:]:
+            for p in history[-3:]:
                 vm = (p[:, 2] > self.config.kpts_conf_min) & (p[:, 0] > 0) & (p[:, 1] > 0)
                 vk = p[vm]
                 if len(vk) >= self.config.min_valid_kpts:
@@ -232,7 +234,7 @@ class StrokeRecognizerV2:
     
     
     def _detect_gradual_collapse(self, track_id: int, frame_height: float) -> dict:
-        ar_buf = list(self._aspect_history[track_id])
+        ar_buf = self._aspect_history[track_id]
         vel_buf = self._vel_history[track_id]
         
         if len(ar_buf) < self.config.slump_window:
@@ -240,11 +242,12 @@ class StrokeRecognizerV2:
             return self._result(False, 0.0, 'Normal', 'low')
         
         half = self.config.slump_window // 2
-        ar_early = float(np.mean(ar_buf[:half]))
-        ar_late = float(np.mean(ar_buf[half:]))
+        ar_values = tuple(ar_buf)
+        ar_early = sum(ar_values[:half]) / half
+        ar_late = sum(ar_values[half:]) / (len(ar_values) - half)
         ar_trend_up = ar_late > ar_early + 0.15
         
-        avg_vel = float(np.mean(list(vel_buf))) if vel_buf else 0.0
+        avg_vel = (sum(vel_buf) / len(vel_buf)) if vel_buf else 0.0
         vel_positive = avg_vel > self.config.slump_vel_ratio * frame_height
         
         cur_ar_ok = ar_late > self.config.slump_aspect_min
