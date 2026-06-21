@@ -111,8 +111,14 @@ def feed_stream(recognizer, frames, track_id=1):
 def test_sudden_fall():
     section("Sudden fall streaming")
     recognizer = StrokeRecognizerV2(debug=False)
-    frames = [make_standing_pose(120) for _ in range(5)]
-    frames += [make_standing_pose(280) for _ in range(2)]
+    frames = [make_standing_pose(100) for _ in range(5)]
+    # Tích lũy đủ fall_distance > 72 (15% của 480)
+    frames.append(make_standing_pose(120))
+    frames.append(make_standing_pose(140))
+    frames.append(make_standing_pose(160))
+    frames.append(make_standing_pose(180))
+    # Rớt mạnh để vượt max_vel
+    frames.append(make_standing_pose(250))
     result = feed_stream(recognizer, frames, track_id=1)
     check("detected", result["detected"], str(result))
     check("symptom", result["symptom"] == "Sudden_Fall", result["symptom"])
@@ -141,11 +147,53 @@ def test_normal_activity():
     check("low risk", result["risk_level"] == "low", result["risk_level"])
 
 
+def make_sitting_bend(conf=0.9):
+    kpts = np.zeros((17, 3))
+    base_y = 150
+    kpts[0] = [320, base_y + 10, conf] # Nose
+    kpts[11] = [300, base_y, conf] # Hips
+    kpts[12] = [340, base_y, conf]
+    kpts[15] = [300, base_y + 40, conf]
+    kpts[16] = [340, base_y + 40, conf]
+    return kpts
+
+def test_sitting_bend():
+    section("Sitting bend (No false positive)")
+    recognizer = StrokeRecognizerV2(debug=False)
+    frames = [make_sitting_bend() for _ in range(15)]
+    result = feed_stream(recognizer, frames, track_id=5)
+    check("not detected", not result["detected"], str(result))
+
+
+def test_recovery():
+    section("Recovery logic")
+    recognizer = StrokeRecognizerV2(debug=False)
+    
+    # 1. Trigger fall
+    frames = [make_standing_pose(100) for _ in range(5)]
+    frames.append(make_standing_pose(120))
+    frames.append(make_standing_pose(140))
+    frames.append(make_standing_pose(160))
+    frames.append(make_standing_pose(180))
+    frames.append(make_standing_pose(250))
+    result = feed_stream(recognizer, frames, track_id=4)
+    check("detected fall", result["detected"], str(result))
+    
+    # 2. Recovery frame (đứng lên)
+    recovery_frames = [make_standing_pose(100)]
+    result = feed_stream(recognizer, recovery_frames, track_id=4)
+    check("recovery cancels alert", not result["detected"], str(result))
+
+
 def test_multiple_tracks():
     section("Multiple tracks independent state")
     recognizer = StrokeRecognizerV2(debug=False)
-    fall_frames = [make_standing_pose(120) for _ in range(5)]
-    fall_frames += [make_standing_pose(280) for _ in range(2)]
+    fall_frames = [make_standing_pose(100) for _ in range(5)]
+    fall_frames.append(make_standing_pose(120))
+    fall_frames.append(make_standing_pose(140))
+    fall_frames.append(make_standing_pose(160))
+    fall_frames.append(make_standing_pose(180))
+    fall_frames.append(make_standing_pose(250))
     normal_frames = [make_standing_pose(120) for _ in range(10)]
     fall_result = feed_stream(recognizer, fall_frames, track_id=10)
     normal_result = feed_stream(recognizer, normal_frames, track_id=20)
@@ -169,6 +217,8 @@ if __name__ == "__main__":
         test_sudden_fall,
         test_abnormal_posture,
         test_normal_activity,
+        test_sitting_bend,
+        test_recovery,
         test_multiple_tracks,
         test_performance,
     ]:

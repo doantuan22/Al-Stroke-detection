@@ -19,7 +19,6 @@ from typing import Optional
 # ── COCO class IDs có thể dùng làm baseline ───────────────────
 COCO_WEAPON_CLASSES = {
     43: 'knife',        # dao/kéo
-    76: 'scissors',     # kéo (có thể nguy hiểm)
 }
 
 # ── Class IDs cho fine-tuned weapon model (Roboflow) ──────────
@@ -55,6 +54,13 @@ class WeaponDetector:
         cooldown: float      = ALERT_COOLDOWN,
         wrist_distance_threshold: float = 80.0,
         pose_confidence_boost: float = 0.15,
+        min_pose_associated_conf: float = 0.40,
+        min_unassociated_conf: float = 0.85,
+        require_pose_association: bool = False,
+        min_persistence_sec: float = 0.0,
+        strict_pose_classes: Optional[list[str]] = None,
+        class_confidence_thresholds: Optional[dict[str, float]] = None,
+        class_area_ratio_limits: Optional[dict[str, float]] = None,
     ):
         """
         Args:
@@ -69,14 +75,32 @@ class WeaponDetector:
         self.conf          = conf
         self.bearer_radius = bearer_radius
         self.cooldown      = cooldown
-        self.wrist_distance_threshold = wrist_distance_threshold
+        self.wrist_distance_threshold = max(100.0, wrist_distance_threshold)
         self.pose_confidence_boost = pose_confidence_boost
+        self.min_pose_associated_conf = min_pose_associated_conf
+        self.min_unassociated_conf = min_unassociated_conf
+        self.require_pose_association = require_pose_association
+        self.min_persistence_sec = min_persistence_sec
+        self.strict_pose_classes = {
+            str(name).lower() for name in (strict_pose_classes or ["gun", "pistol", "rifle"])
+        }
+        self.class_confidence_thresholds = {
+            str(k).lower(): float(v)
+            for k, v in (class_confidence_thresholds or {}).items()
+        }
+        self.class_area_ratio_limits = {
+            str(k).lower(): float(v)
+            for k, v in (class_area_ratio_limits or {}).items()
+        }
 
         # Map class IDs theo model đang dùng
-        self.weapon_classes = (
-            FINETUNE_WEAPON_CLASSES if use_finetune
-            else COCO_WEAPON_CLASSES
-        )
+        if use_finetune:
+            # Lấy trực tiếp từ class names của model chuyên dụng
+            self.weapon_classes = {k: str(v).lower() for k, v in self.od.model.names.items()}
+            print(f"[WeaponDetector] Using fine-tuned model classes: {self.weapon_classes}")
+        else:
+            self.weapon_classes = COCO_WEAPON_CLASSES
+            
         self.weapon_class_ids = list(self.weapon_classes.keys())
 
         # Cooldown tracker per location key (cho upload)
@@ -91,6 +115,7 @@ class WeaponDetector:
         self,
         frame_or_objs,
         persons: list[dict],
+        coco_objects: Optional[list[dict]] = None,
         zone_name: Optional[str] = None,
         camera_id: str           = 'CAM_00',
     ) -> list[dict]:
@@ -118,7 +143,7 @@ class WeaponDetector:
                 and obj.get('conf', 0) >= self.conf
             ]
         else:
-            all_objects = self.od.detect(
+            all_objects, ran_inf = self.od.track(
                 frame_or_objs,
                 classes=self.weapon_class_ids,
                 conf=self.conf,
@@ -137,15 +162,73 @@ class WeaponDetector:
             class_name = self.weapon_classes[cid]
             conf_val   = obj['conf']
 
+            # ── ENSEMBLE FILTERING (Chống Ảo Giác Model Yếu) ──
+            # Nếu model weapon_yolo.pt nhận nhầm bình nước/cái ghế thành súng,
+            # nhưng model COCO chuẩn báo đó là bình nước, ta sẽ tin COCO và hủy bỏ!
+            if coco_objects and self.use_finetune:
+                is_harmless = False
+                # 39: bottle, 41: cup, 56: chair, 57: couch, 63: laptop, 64: mouse, 67: cell phone, 73: book
+                harmless_classes = {39, 41, 56, 57, 63, 64, 67, 73, 74}
+                for co in coco_objects:
+                    cid_coco = co.get('class_id')
+                    if cid_coco in harmless_classes:
+                        c_bbox = co['bbox']
+                        # Tính IoU (Intersection over Union)
+                        xA = max(bbox[0], c_bbox[0])
+                        yA = max(bbox[1], c_bbox[1])
+                        xB = min(bbox[2], c_bbox[2])
+                        yB = min(bbox[3], c_bbox[3])
+                        interArea = max(0, xB - xA) * max(0, yB - yA)
+                        if interArea > 0:
+                            boxAArea = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+                            boxBArea = (c_bbox[2] - c_bbox[0]) * (c_bbox[3] - c_bbox[1])
+                            iou = interArea / float(boxAArea + boxBArea - interArea + 1e-5)
+                            # Nếu vũ khí chồng chéo hơn 30% với bình nước/điện thoại/ghế -> ẢO GIÁC!
+                            if iou > 0.3:
+                                is_harmless = True
+                                break
+                if is_harmless:
+                    continue  # Bỏ qua false positive ngớ ngẩn này
+
             cx = (bbox[0] + bbox[2]) / 2
             cy = (bbox[1] + bbox[3]) / 2
 
-            # Cell lưới 80px (rộng hơn) để dao di chuyển nhẹ không tạo key mới
-            loc_key = f"{class_name}_{int(cx//80)}_{int(cy//80)}"
+            # KHÔNG DÙNG track_id CHO loc_key! YOLO ByteTrack ở 15fps rất dễ bị đổi ID liên tục.
+            # Nếu đổi ID, nó sẽ tạo loc_key mới và lọt qua cooldown gây bão spam cảnh báo.
+            # Dùng spatial matching (150px) là ổn định nhất để chặn bão spam.
+            matched_key = None
+            for key, det in self._active_detections.items():
+                if det['class_name'] == class_name:
+                    dbbox = det['bbox']
+                    dcx = (dbbox[0] + dbbox[2]) / 2
+                    dcy = (dbbox[1] + dbbox[3]) / 2
+                    if (cx - dcx)**2 + (cy - dcy)**2 < 150**2:
+                        matched_key = key
+                        break
+            
+            if matched_key:
+                loc_key = matched_key
+            else:
+                loc_key = f"{class_name}_{int(cx)}_{int(cy)}"
+                    
             seen_keys.add(loc_key)
 
             # Xác định bearer (người đang cầm)
-            bearer_id, hand_distance, pose_associated = self._find_bearer_details(cx, cy, persons)
+            bearer_id, hand_distance, pose_associated, bearer_bbox = self._find_bearer_details(cx, cy, persons)
+            
+            # ── BẢO VỆ KÉP (DUAL THRESHOLD) ──
+            if class_name in self.strict_pose_classes and not pose_associated:
+                continue
+            if not pose_associated and self.require_pose_association:
+                continue
+
+            req_conf = max(self.conf, self._class_min_conf(class_name, pose_associated))
+            if conf_val < req_conf:
+                continue
+
+            if not self._weapon_bbox_sane(class_name, bbox, bearer_bbox):
+                continue
+            
             adjusted_conf = min(
                 1.0,
                 conf_val + (self.pose_confidence_boost if pose_associated else 0.0)
@@ -154,38 +237,73 @@ class WeaponDetector:
             # Risk level
             risk = 'critical' if zone_name else 'high'
 
-            # Cập nhật persistent detection (dùng cho overlay liên tục)
-            self._active_detections[loc_key] = {
-                'bbox'        : bbox,
-                'class_name'  : class_name,
-                'conf'        : adjusted_conf,
-                'bearer_id'   : bearer_id,
-                'hand_distance': hand_distance,
-                'risk_level'  : risk,
-                'zone_name'   : zone_name,
-                'camera_id'   : camera_id,
-                'last_seen'   : now,
-            }
+            # Cập nhật persistent detection
+            if loc_key not in self._active_detections:
+                # Vũ khí mới xuất hiện
+                self._active_detections[loc_key] = {
+                    'bbox'        : bbox,
+                    'class_name'  : class_name,
+                    'conf'        : adjusted_conf,
+                    'bearer_id'   : bearer_id,
+                    'hand_distance': hand_distance,
+                    'risk_level'  : risk,
+                    'zone_name'   : zone_name,
+                    'camera_id'   : camera_id,
+                    'first_seen'  : now,
+                    'last_seen'   : now,
+                    'alerted'     : False,
+                }
+            else:
+                # Vũ khí đã có, cập nhật trạng thái mới nhất
+                det = self._active_detections[loc_key]
+                det['bbox'] = bbox
+                det['conf'] = adjusted_conf
+                det['bearer_id'] = bearer_id
+                det['hand_distance'] = hand_distance
+                det['risk_level'] = risk
+                det['zone_name'] = zone_name
+                det['last_seen'] = now
 
-            # Cooldown check — chỉ upload khi đủ thời gian
-            if now - self._last_alert.get(loc_key, 0) < self.cooldown:
-                continue
+            det = self._active_detections[loc_key]
 
-            self._last_alert[loc_key] = now
-            alerts.append({
-                'event_type'  : 'weapon_detected',
-                'track_id'    : bearer_id,
-                'object_class': class_name,
-                'bbox'        : bbox,
-                'confidence'  : adjusted_conf,
-                'risk_level'  : risk,
-                'zone_name'   : zone_name,
-                'camera_id'   : camera_id,
-                'duration_sec': 0.0,
-                'bearer_id'   : bearer_id,
-                'hand_distance': hand_distance,
-                'pose_associated': pose_associated,
-            })
+            # Kiểm tra thời gian xuất hiện liên tục mới được phép gửi alert.
+            if now - det['first_seen'] >= self.min_persistence_sec:
+                # Đã đủ 5 giây liên tục
+                if not det['alerted']:
+                    det['alerted'] = True
+                    self._last_alert[loc_key] = now
+                    alerts.append({
+                        'event_type'  : 'weapon_detected',
+                        'track_id'    : bearer_id,
+                        'object_class': class_name,
+                        'bbox'        : bbox,
+                        'confidence'  : adjusted_conf,
+                        'risk_level'  : risk,
+                        'zone_name'   : zone_name,
+                        'camera_id'   : camera_id,
+                        'duration_sec': round(now - det['first_seen'], 1),
+                        'bearer_id'   : bearer_id,
+                        'hand_distance': hand_distance,
+                        'pose_associated': pose_associated,
+                    })
+                else:
+                    # Đã gửi alert trước đó rồi, tiếp tục gửi theo chu kỳ cooldown
+                    if now - self._last_alert.get(loc_key, 0) >= self.cooldown:
+                        self._last_alert[loc_key] = now
+                        alerts.append({
+                            'event_type'  : 'weapon_detected',
+                            'track_id'    : bearer_id,
+                            'object_class': class_name,
+                            'bbox'        : bbox,
+                            'confidence'  : adjusted_conf,
+                            'risk_level'  : risk,
+                            'zone_name'   : zone_name,
+                            'camera_id'   : camera_id,
+                            'duration_sec': round(now - det['first_seen'], 1),
+                            'bearer_id'   : bearer_id,
+                            'hand_distance': hand_distance,
+                            'pose_associated': pose_associated,
+                        })
 
         # Dọn các detection không còn nhìn thấy lâu hơn OVERLAY_PERSIST giây
         expired = [
@@ -237,11 +355,12 @@ class WeaponDetector:
 
     def _find_bearer_details(
         self, cx: float, cy: float, persons: list[dict]
-    ) -> tuple[Optional[int], Optional[float], bool]:
+    ) -> tuple[Optional[int], Optional[float], bool, Optional[list[float]]]:
         best_dist = float('inf')
         best_id = None
         best_hand_distance = None
         best_pose_associated = False
+        best_bbox = None
 
         for p in persons:
             pb = p.get('bbox') or []
@@ -253,9 +372,10 @@ class WeaponDetector:
             if d < self.bearer_radius and d < best_dist:
                 best_dist = d
                 best_id = p.get('track_id')
+                best_bbox = pb[:4]
                 best_hand_distance, best_pose_associated = self._closest_hand_distance(cx, cy, p)
 
-        return best_id, best_hand_distance, best_pose_associated
+        return best_id, best_hand_distance, best_pose_associated, best_bbox
 
     def _closest_hand_distance(self, cx: float, cy: float, person: dict) -> tuple[Optional[float], bool]:
         kpts = person.get('kpts')
@@ -274,6 +394,44 @@ class WeaponDetector:
         if best == float('inf'):
             return None, False
         return best, best <= self.wrist_distance_threshold
+
+    def _class_min_conf(self, class_name: str, pose_associated: bool) -> float:
+        name = str(class_name).lower()
+        if name in self.class_confidence_thresholds:
+            return self.class_confidence_thresholds[name]
+        if pose_associated:
+            return self.min_pose_associated_conf
+        return self.min_unassociated_conf
+
+    def _weapon_bbox_sane(
+        self,
+        class_name: str,
+        bbox: list[float],
+        person_bbox: Optional[list[float]],
+    ) -> bool:
+        if len(bbox) < 4:
+            return False
+
+        w = float(bbox[2] - bbox[0])
+        h = float(bbox[3] - bbox[1])
+        if w <= 0 or h <= 0:
+            return False
+
+        name = str(class_name).lower()
+        ratio_limit = self.class_area_ratio_limits.get(name, 0.3)
+        if person_bbox and len(person_bbox) >= 4:
+            pw = float(person_bbox[2] - person_bbox[0])
+            ph = float(person_bbox[3] - person_bbox[1])
+            person_area = max(pw * ph, 1e-6)
+            weapon_area = w * h
+            if weapon_area > person_area * ratio_limit:
+                return False
+
+            if name in {"gun", "pistol", "rifle"}:
+                if w > pw * 0.7 or h > ph * 0.55:
+                    return False
+
+        return True
 
     def get_class_ids(self) -> list[int]:
         """Trả về danh sách class IDs đang theo dõi."""

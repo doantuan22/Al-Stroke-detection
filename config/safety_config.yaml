@@ -7,6 +7,7 @@ camera:
 inference:
   pose_input_size: 768
   object_input_size: 960
+  object_prefilter_confidence: 0.30
   pose_skip_default: 2
   pose_skip_max: 4
   object_skip_default: 2
@@ -22,12 +23,17 @@ tracking:
   max_history: 30
   grace_frames: 15
 
+person:
+  min_confidence: 0.55
+  min_valid_keypoints: 6
+  min_bbox_height_px: 48
+
 alert:
   dedup_window_sec: 10
   evidence_frames_before: 5
   evidence_frames_after: 5
   max_stroke_uploads_per_track: 3
-  stroke_upload_every_nth_alert: 3
+  stroke_upload_every_nth_alert: 2
   stroke_track_cooldown_sec: 5
   severity:
     observing: 0.4
@@ -45,7 +51,7 @@ stroke:
   aspect_ratio_min: 1.2
   bbox_h_max_ratio: 0.45
   head_hip_margin: 0.15
-  sustained_posture: 6
+  sustained_posture: 30
   slump_aspect_min: 0.8
   slump_vel_ratio: 0.025
   slump_window: 12
@@ -57,9 +63,19 @@ stroke:
 
 baggage:
   class_ids: [24, 26, 28]
-  confidence_threshold: 0.22
+  confidence_threshold: 0.45
+  class_confidence_thresholds:
+    backpack: 0.50
+    handbag: 0.55
+    suitcase: 0.48
+  min_confirmed_seen_sec: 1.0
+  min_confirmed_frames: 2
+  min_box_width_px: 12
+  min_box_height_px: 12
+  min_aspect_ratio: 0.25
+  max_aspect_ratio: 4.0
   owner_radius_px: 160
-  proximity_expand_px: 80
+  proximity_expand_px: 150
   abandoned_timeout_sec: 60
   cooldown_sec: 120
   owner_presence_grace_sec: 2
@@ -78,13 +94,30 @@ baggage:
 weapon:
   model_path: models/weapon_yolo.pt
   fallback_to_coco: true
-  confidence_threshold: 0.15
+  confidence_threshold: 0.45
+  min_pose_associated_confidence: 0.55
+  min_unassociated_confidence: 0.85
+  require_pose_association: false
+  strict_pose_classes: [gun, pistol, rifle]
+  class_confidence_thresholds:
+    gun: 0.78
+    pistol: 0.72
+    rifle: 0.76
+    knife: 0.45
+    scissors: 0.50
+  class_area_ratio_limits:
+    gun: 0.18
+    pistol: 0.15
+    rifle: 0.22
+    knife: 0.35
+    scissors: 0.30
+  min_persistence_sec: 1.0
   bearer_radius_px: 200
-  wrist_distance_threshold: 80
+  wrist_distance_threshold: 100
   pose_confidence_boost: 0.15
   cooldown_sec: 5
   overlay_persist_sec: 2
-  coco_class_ids: [43, 76]
+  coco_class_ids: [43]
 
 zones:
   default:

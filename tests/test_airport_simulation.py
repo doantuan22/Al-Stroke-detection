@@ -111,14 +111,15 @@ person  = make_person(track_id=1, cx=300, cy=240)  # đứng ngay cạnh túi
 alerts = tracker.update([bag], [person])
 check("Có chủ đứng cạnh → 0 alerts", len(alerts) == 0)
 
-state = tracker.get_all_states().get(10)
+assigned_id = list(tracker.get_all_states().keys())[0]
+state = tracker.get_all_states().get(assigned_id)
 check("State được tạo", state is not None)
 check("owner_gone_at = None (đang có chủ)", state.owner_gone_at is None)
 
 # Chủ rời đi (person ra xa)
 far_person = make_person(track_id=1, cx=600, cy=400)  # cách 350px
 alerts = tracker.update([bag], [far_person])           # trigger owner_gone_at
-state  = tracker.get_all_states().get(10)
+state  = tracker.get_all_states().get(assigned_id)
 check("Chủ rời đi → owner_gone_at được set", state.owner_gone_at is not None)
 check("Chưa timeout → 0 alerts", len(alerts) == 0)
 
@@ -151,15 +152,22 @@ stranger = make_person(track_id=2, cx=600, cy=400)
 tracker2.update([bag2], [owner])
 # Chủ đi xa
 tracker2.update([bag2], [stranger])
-state2 = tracker2.get_all_states().get(20)
+assigned_id2 = list(tracker2.get_all_states().keys())[0]
+state2 = tracker2.get_all_states().get(assigned_id2)
 gone_at = state2.owner_gone_at
 check("owner_gone_at được set sau khi chủ đi", gone_at is not None)
+
+# Người lạ tới gần ngay lập tức (không đủ 5s) → KHÔNG RESET
+time.sleep(0.5)
+tracker2.update([bag2], [stranger])
+state2 = tracker2.get_all_states().get(assigned_id2)
+check("Người lạ đứng gần không reset timer (Stranger Lock)", state2.owner_gone_at is not None)
 
 # Chủ quay lại ngay (trước timeout)
 time.sleep(0.5)
 tracker2.update([bag2], [owner])
-state2 = tracker2.get_all_states().get(20)
-check("Chủ quay lại → owner_gone_at reset về None",
+state2 = tracker2.get_all_states().get(assigned_id2)
+check("Chủ thật quay lại → owner_gone_at reset về None",
       state2.owner_gone_at is None)
 check("alerted = False sau reset", state2.alerted == False)
 
@@ -246,12 +254,28 @@ tracker5 = AbandonedBaggageTracker(timeout=5.0, grace_period=0.0)
 
 bag5     = make_bag(track_id=50, cx=300, cy=300)
 tracker5.update([bag5], [])
-check("State 50 được tạo", 50 in tracker5.get_all_states())
+assigned_id5 = list(tracker5.get_all_states().keys())[0]
+check("State 50 được tạo", assigned_id5 in tracker5.get_all_states())
 
 # Túi biến mất (không còn trong objects)
 tracker5.update([], [])
 check("State 50 bị xóa khi túi biến khỏi frame",
-      50 not in tracker5.get_all_states())
+      assigned_id5 not in tracker5.get_all_states())
+
+# ══════════════════════════════════════════════════════════════
+# TEST 5.1: Adjacent Bags (Custom Tracker + NMS)
+# ══════════════════════════════════════════════════════════════
+section("TEST 5.1: Adjacent Bags — Đặt sát nhau")
+
+tracker_adj = AbandonedBaggageTracker()
+# 2 bags very close (cx=300 vs cx=320), overlap is ~60% (IoU > 0.45 but < 0.85)
+bag_adj1 = make_bag(track_id=1, cx=300, cy=300, class_id=24)
+bag_adj2 = make_bag(track_id=2, cx=320, cy=300, class_id=28)
+
+tracker_adj.update([bag_adj1, bag_adj2], [])
+states_adj = tracker_adj.get_all_states()
+check("Hai túi đặt sát nhau đều được nhận diện (không bị xóa bởi NMS cũ)", len(states_adj) == 2)
+
 
 
 # ══════════════════════════════════════════════════════════════
@@ -278,10 +302,10 @@ except Exception as e:
     check("Person với bbox rỗng → CRASH", False, str(e))
 
 # Object class không phải hành lý (xe đạp, v.v.)
+tracker_bicycle = AbandonedBaggageTracker()
 non_bag = make_bag(track_id=70, cx=300, cy=300, class_id=1)  # bicycle
-tracker6.update([non_bag], [])
-check("Object class lạ (bicycle) bị bỏ qua",
-      70 not in tracker6.get_all_states())
+tracker_bicycle.update([non_bag], [])
+check("Object class lạ (bicycle) bị bỏ qua", len(tracker_bicycle.get_all_states()) == 0)
 
 # Object thiếu 'bbox' — đã fix trong baggage_tracker.py bằng lọc trước
 bad_obj = {
@@ -309,6 +333,9 @@ class MockObjectDetector:
 
     def detect(self, frame, classes=None, conf=0.5):
         return self._return
+        
+    def track(self, frame, classes=None, conf=0.5):
+        return self._return, True
 
 
 # Scenario: Dao ở gần người
@@ -316,10 +343,16 @@ knife_obj = make_weapon(cx=310, cy=250, class_id=43, conf=0.72)
 person_w  = make_person(track_id=5, cx=300, cy=240)
 
 mock_od = MockObjectDetector(return_objects=[knife_obj])
-wd = WeaponDetector(object_detector=mock_od, conf=0.50, cooldown=2.0)
+wd = WeaponDetector(object_detector=mock_od, conf=0.20, cooldown=2.0)
 
 alerts_w = wd.detect_frame(make_frame(), persons=[person_w])
-check("Knife trong frame → 1 alert", len(alerts_w) == 1)
+check("Knife mới xuất hiện → 0 alert (đợi 5s)", len(alerts_w) == 0)
+
+# Simulate 5.1 seconds later
+time.sleep(5.1)
+alerts_w = wd.detect_frame(make_frame(), persons=[person_w])
+check("Sau 5s → có 1 alert", len(alerts_w) == 1)
+
 if alerts_w:
     a = alerts_w[0]
     check("event_type = weapon_detected", a['event_type'] == 'weapon_detected')
@@ -339,14 +372,14 @@ time.sleep(2.1)
 alerts_w3 = wd.detect_frame(make_frame(), persons=[person_w])
 check("Sau weapon cooldown → alert lại", len(alerts_w3) == 1)
 
-
 # ══════════════════════════════════════════════════════════════
 # TEST 8: Weapon — Zone → risk = critical
 # ══════════════════════════════════════════════════════════════
 section("TEST 8: Weapon trong Zone nhạy cảm → Critical")
 
 wd2     = WeaponDetector(object_detector=mock_od, conf=0.50, cooldown=0.1)
-time.sleep(0.15)
+wd2.detect_frame(make_frame(), persons=[], zone_name="Security Checkpoint")
+time.sleep(5.1)
 alerts_zone = wd2.detect_frame(
     make_frame(), persons=[], zone_name="Security Checkpoint")
 check("Weapon trong zone → risk = critical",
@@ -369,7 +402,8 @@ section("TEST 9: Weapon không có bearer (dao trên bàn)")
 wd3 = WeaponDetector(
     object_detector=MockObjectDetector([knife_obj]),
     conf=0.50, cooldown=0.1)
-time.sleep(0.15)
+wd3.detect_frame(make_frame(), persons=[])
+time.sleep(5.1)
 # Không có người nào trong frame
 alerts_nb = wd3.detect_frame(make_frame(), persons=[])
 check("Alert vẫn tạo khi không có bearer", len(alerts_nb) == 1)
@@ -401,8 +435,11 @@ obj_results_mock = [
     }
 ]
 
-# Truyền trực tiếp list obj_results
+# Truyền list obj_results thay vì frame
+wd_opt.detect_frame(obj_results_mock, persons=[person_w_opt])
+time.sleep(5.1)
 alerts_opt = wd_opt.detect_frame(obj_results_mock, persons=[person_w_opt])
+
 check("Truyền trực tiếp obj_results → nhận diện được vũ khí", len(alerts_opt) == 1)
 if alerts_opt:
     a = alerts_opt[0]

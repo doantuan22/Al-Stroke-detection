@@ -37,6 +37,7 @@ class BaggageState:
     risk_score: float = 0.0
     owner_scores: dict[int, float] = field(default_factory=dict)
     center_history: deque = field(default_factory=lambda: deque(maxlen=20))
+    seen_count: int = 0
     # Trạng thái chủ hành lý frame trước (để phát hiện transition)
     _prev_has_owner: bool  = True   # Giả sử ban đầu có chủ để tránh false alarm ngay lúc xuất hiện
 
@@ -115,6 +116,13 @@ class AbandonedBaggageTracker:
         self.grace_period = grace_period
         self.owner_presence_grace_period = owner_presence_grace_period
         self.confidence_threshold = float(cfg.get('confidence_threshold', 0.22))
+        self.class_confidence_thresholds = cfg.get('class_confidence_thresholds', {}) or {}
+        self.min_confirmed_seen_sec = float(cfg.get('min_confirmed_seen_sec', 0.0))
+        self.min_confirmed_frames = int(cfg.get('min_confirmed_frames', 1))
+        self.min_box_width = float(cfg.get('min_box_width_px', 0.0))
+        self.min_box_height = float(cfg.get('min_box_height_px', 0.0))
+        self.min_aspect_ratio = float(cfg.get('min_aspect_ratio', 0.0))
+        self.max_aspect_ratio = float(cfg.get('max_aspect_ratio', 999.0))
         self.proximity_expand = float(cfg.get('proximity_expand_px', PROXIMITY_EXPAND))
         self.stationary_velocity_threshold = float(cfg.get('stationary_velocity_threshold', 2.0))
         self.stationary_duration = float(cfg.get('stationary_duration_sec', 3.0))
@@ -124,6 +132,7 @@ class AbandonedBaggageTracker:
         self.zone_timeouts = (config or {}).get('zones', {})
 
         self._states   : dict[int, BaggageState] = {}
+        self._next_bag_id: int = 1
 
         self._dirty_ids: set[int] = set()   # IDs cần sync DB
 
@@ -154,12 +163,7 @@ class AbandonedBaggageTracker:
         alerts = []
 
         # Lọc chỉ lấy hành lý có class_id hợp lệ, bbox đủ và conf >= 0.22
-        bags = [
-            o for o in objects
-            if o.get('class_id') in BAGGAGE_CLASS_IDS
-            and o.get('bbox') and len(o.get('bbox', [])) >= 4
-            and o.get('conf', 0) >= self.confidence_threshold
-        ]
+        bags = [o for o in objects if self._is_plausible_baggage(o)]
 
         # Áp dụng NMS tránh các box hành lý trùng nhau của YOLO (backpack vs handbag vs suitcase)
         bags = sorted(bags, key=lambda x: x.get('conf', 0), reverse=True)
@@ -167,29 +171,43 @@ class AbandonedBaggageTracker:
         for b in bags:
             overlap = False
             for kept in keep_bags:
-                if _calculate_iou(b['bbox'], kept['bbox']) > 0.45:
+                # Nới lỏng NMS (0.85) để cho phép balo đặt sát nhau
+                if _calculate_iou(b['bbox'], kept['bbox']) > 0.85:
                     overlap = True
                     break
             if not overlap:
                 keep_bags.append(b)
         bags = keep_bags
 
+        # ── CUSTOM IOU TRACKER ─────────────────────────────────────
+        # Gán ID nội bộ bằng IoU matching, phớt lờ hoàn toàn track_id của YOLO
+        # Điều này giải quyết dứt điểm lỗi YOLO tự nhảy/đảo ID giữa các túi.
+        matched_bag_ids = set()
+        for bag in bags:
+            best_iou = 0.0
+            best_tid = None
+            for tid, state in self._states.items():
+                if tid in matched_bag_ids:
+                    continue
+                iou = _calculate_iou(bag['bbox'], state.bbox)
+                if iou > 0.45 and iou > best_iou:
+                    best_iou = iou
+                    best_tid = tid
+            
+            if best_tid is not None:
+                bag['track_id'] = best_tid
+                matched_bag_ids.add(best_tid)
+            else:
+                external_tid = bag.get('track_id')
+                if isinstance(external_tid, int) and external_tid not in self._states:
+                    bag['track_id'] = external_tid
+                    self._next_bag_id = max(self._next_bag_id, external_tid + 1)
+                else:
+                    bag['track_id'] = self._next_bag_id
+                    self._next_bag_id += 1
+
         active_bag_ids = {b['track_id'] for b in bags}
         person_features = self._prepare_person_features(persons)
-
-        # 1. Khắc phục chuyển ID (tracker switching): Nếu một state cũ (đang chờ grace period) 
-        # bị trùng lấp vị trí với một bag mới hoạt động, ta kế thừa state cũ cho ID mới để giữ nguyên bộ đếm thời gian.
-        for tid in list(self._states.keys()):
-            if tid not in active_bag_ids:
-                old_state = self._states[tid]
-                for bag in bags:
-                    new_tid = bag['track_id']
-                    if _calculate_iou(old_state.bbox, bag['bbox']) > 0.45:
-                        if new_tid not in self._states:
-                            old_state.track_id = new_tid
-                            self._states[new_tid] = old_state
-                        del self._states[tid]
-                        break
 
         # 2. Dọn track đã biến mất quá grace_period thực sự
         for tid in list(self._states.keys()):
@@ -221,6 +239,7 @@ class AbandonedBaggageTracker:
             state           = self._states[tid]
             state.bbox      = bbox
             state.last_seen = now
+            state.seen_count += 1
 
 
             # Tâm của hành lý
@@ -230,7 +249,8 @@ class AbandonedBaggageTracker:
             self._update_owner_scores(state, cx, cy, person_features, now)
 
             # ── Kiểm tra owner ──────────────────────────────
-            has_owner = self._has_nearby_person(cx, cy, bbox, person_features)
+            nearby_person_id = self._get_nearby_person_id(cx, cy, bbox, person_features)
+            has_owner = (nearby_person_id is not None)
 
             # Phat hien transition owner
             if state._prev_has_owner and not has_owner:
@@ -242,23 +262,26 @@ class AbandonedBaggageTracker:
 
             if has_owner:
                 # Có người đứng gần túi
+                is_real_owner = (nearby_person_id == state.likely_owner_id)
+                # Người lạ cần đứng gần lâu hơn (5s) mới được tính là owner mới,
+                # còn chủ cũ (hoặc chưa xác định) thì dùng grace period mặc định (2s)
+                required_grace = self.owner_presence_grace_period if (is_real_owner or state.likely_owner_id is None) else 5.0
+                
                 if state.owner_gone_at is not None:
-                    # Nếu cấu hình grace period bằng 0, reset ngay lập tức
-                    if self.owner_presence_grace_period <= 0.0:
+                    # Cần người đứng gần liên tục đủ lâu mới reset
+                    if required_grace <= 0.0:
                         state.owner_gone_at = None
                         state.owner_seen_at = None
                         state.alerted       = False
                         self._dirty_ids.add(tid)
-                    else:
-                        # Cần người đứng gần liên tục >= self.owner_presence_grace_period mới reset
-                        if state.owner_seen_at is None:
-                            state.owner_seen_at = now
-                        elif now - state.owner_seen_at >= self.owner_presence_grace_period:
-                            # Xác nhận chủ quay lại thực sự
-                            state.owner_gone_at = None
-                            state.owner_seen_at = None
-                            state.alerted       = False
-                            self._dirty_ids.add(tid)
+                    elif state.owner_seen_at is None:
+                        state.owner_seen_at = now
+                    elif now - state.owner_seen_at >= required_grace:
+                        # Xác nhận có chủ quay lại / nhận túi
+                        state.owner_gone_at = None
+                        state.owner_seen_at = None
+                        state.alerted       = False
+                        self._dirty_ids.add(tid)
                 else:
                     state.owner_seen_at = None
 
@@ -275,7 +298,15 @@ class AbandonedBaggageTracker:
             # BUG FIX: dùng self.timeout thay vì is_suspicious (vốn dùng constant)
             timeout = self._timeout_for_zone(zone_name)
             state.risk_score = self._calculate_risk(state, has_owner, timeout)
-            if state.abandon_seconds >= timeout and state.risk_score >= self.risk_alert_threshold:
+            confirmed_long_enough = (
+                state.seen_count >= self.min_confirmed_frames
+                and now - state.first_seen >= self.min_confirmed_seen_sec
+            )
+            if (
+                confirmed_long_enough
+                and state.abandon_seconds >= timeout
+                and state.risk_score >= self.risk_alert_threshold
+            ):
                 can_alert = (now - state.last_alert_at) >= self.cooldown
                 if can_alert:
                     state.last_alert_at = now
@@ -299,6 +330,30 @@ class AbandonedBaggageTracker:
                     })
 
         return alerts
+
+    def _is_plausible_baggage(self, obj: dict) -> bool:
+        cid = obj.get('class_id')
+        if cid not in BAGGAGE_CLASS_IDS:
+            return False
+        bbox = obj.get('bbox') or []
+        if len(bbox) < 4:
+            return False
+
+        cls_name = BAGGAGE_CLASS_IDS.get(cid, 'bag')
+        conf = float(obj.get('conf', 0.0))
+        required_conf = max(
+            self.confidence_threshold,
+            float(self.class_confidence_thresholds.get(cls_name, 0.0)),
+        )
+        if conf < required_conf:
+            return False
+
+        width = float(bbox[2] - bbox[0])
+        height = float(bbox[3] - bbox[1])
+        if width < self.min_box_width or height < self.min_box_height:
+            return False
+        aspect = width / max(height, 1e-6)
+        return self.min_aspect_ratio <= aspect <= self.max_aspect_ratio
 
     def get_all_states(self) -> dict[int, BaggageState]:
         """Trả về toàn bộ state hiện tại (dùng để vẽ overlay)."""
@@ -334,39 +389,34 @@ class AbandonedBaggageTracker:
             })
         return features
 
-    def _has_nearby_person(
+    def _get_nearby_person_id(
         self, cx: float, cy: float, bag_bbox: list, persons: list[dict]
-    ) -> bool:
+    ) -> Optional[int]:
         """
-        Kiểm tra xem có người nào đứng gần hành lý không.
-        Dùng 2 phương pháp song song:
-          1. Center-to-center distance <= owner_radius
-          2. Expanded bag bbox có chồng lấn với person bbox
-             (để bắt người cao đứng sát bên, tâm xa nhưng bbox overlap)
-        conf người tối thiểu 0.35.
+        Trả về track_id của người đứng gần hành lý nhất (nếu có).
+        Đo bằng khoảng cách ngắn nhất giữa Bounding Box của người và túi.
         """
         bx1, by1, bx2, by2 = bag_bbox[:4]
-        # Mở rộng bbox hành lý theo 4 hướng
-        ex1 = bx1 - self.proximity_expand
-        ey1 = by1 - self.proximity_expand
-        ex2 = bx2 + self.proximity_expand
-        ey2 = by2 + self.proximity_expand
+        
+        closest_id = None
+        min_box_dist_sq = float('inf')
+        
+        allowed_dist_sq = self.proximity_expand * self.proximity_expand
 
-        owner_radius_sq = self.owner_radius * self.owner_radius
         for p in persons:
             px1, py1, px2, py2 = p['bbox']
-            dx = cx - p['cx']
-            dy = cy - p['cy']
+            
+            # Khoảng cách ngắn nhất giữa 2 hình chữ nhật (0 nếu giao nhau)
+            dx = max(0.0, max(bx1 - px2, px1 - bx2))
+            dy = max(0.0, max(by1 - py2, py1 - by2))
+            box_dist_sq = dx * dx + dy * dy
 
-            # Phương pháp 1: center-to-center distance
-            if dx * dx + dy * dy <= owner_radius_sq:
-                return True
+            if box_dist_sq <= allowed_dist_sq:
+                if box_dist_sq < min_box_dist_sq:
+                    min_box_dist_sq = box_dist_sq
+                    closest_id = p.get('track_id')
 
-            # Phương pháp 2: expanded bag bbox overlap với person bbox
-            if (ex1 < px2 and ex2 > px1 and ey1 < py2 and ey2 > py1):
-                return True
-
-        return False
+        return closest_id
 
     def _update_motion_state(self, state: BaggageState, cx: float, cy: float, now: float):
         if state.center_history:

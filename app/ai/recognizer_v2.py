@@ -36,7 +36,7 @@ class StrokeConfig:
 
 
 # Số frame giữ trạng thái detected=True sau khi phát hiện (tránh flicker)
-_DETECT_COOLDOWN_FRAMES = 20
+_DETECT_COOLDOWN_FRAMES = 150
 
 
 class StrokeRecognizerV2:
@@ -63,19 +63,6 @@ class StrokeRecognizerV2:
     
     
     def analyze(self, history: list, img_size: tuple, track_id: int = 0) -> dict:
-        # ── Kiểm tra cooldown: nếu đang trong thời gian giữ cảnh báo ──────
-        # Mỗi track_id có cooldown độc lập → nhiều người đột quỵ cùng lúc
-        # không ảnh hưởng lẫn nhau.
-        cooldown = self._detect_cooldown.get(track_id, 0)
-        if cooldown > 0:
-            self._detect_cooldown[track_id] = cooldown - 1
-            cached = self._last_detect_result.get(
-                track_id, self._result(True, 0.85, 'Detected', 'high'))
-            if self.debug:
-                logger.debug(f"[Track {track_id}] In cooldown ({cooldown} frames left), "
-                             f"returning cached: {cached['symptom']}")
-            return cached
-
         if len(history) < 5:
             self._clear_state(track_id)
             return self._result(False, 0.0, 'Normal', 'low')
@@ -94,7 +81,12 @@ class StrokeRecognizerV2:
         )
         valid = latest[valid_mask]
         
+        cooldown = self._detect_cooldown.get(track_id, 0)
+        
         if len(valid) < self.config.min_valid_kpts:
+            if cooldown > 0:
+                self._detect_cooldown[track_id] = cooldown - 1
+                return self._last_detect_result.get(track_id, self._result(True, 0.85, 'Detected', 'high'))
             if self.debug:
                 logger.debug(f"[Track {track_id}] Insufficient valid keypoints: {len(valid)}")
             self._clear_state(track_id)
@@ -104,13 +96,24 @@ class StrokeRecognizerV2:
         prev_hip_y = (prev[11, 1] + prev[12, 1]) * 0.5
         hip_y = (latest[11, 1] + latest[12, 1]) * 0.5
         
+        cur_ar = float(np.ptp(valid[:, 0])) / (float(np.ptp(valid[:, 1])) + 1e-6)
+        
+        # Recovery check: nếu đang báo động mà đứng lên hoặc hông di chuyển lên nhanh -> hủy báo động
+        if cooldown > 0:
+            vel_up = prev_hip_y - hip_y
+            if cur_ar < 1.0 or vel_up > 0.05 * h:
+                if self.debug:
+                    logger.info(f"[Track {track_id}] 🔄 Recovery detected. Canceling alert.")
+                self._detect_cooldown[track_id] = 0
+            else:
+                self._detect_cooldown[track_id] = cooldown - 1
+                return self._last_detect_result.get(track_id, self._result(True, 0.85, 'Detected', 'high'))
+        
         # Chỉ thêm giá trị CUỐI vào buffer (tránh thêm trùng các frame cũ)
         self._vel_history[track_id].append(float(hip_y - prev_hip_y))
-        
-        cur_ar = float(np.ptp(valid[:, 0])) / (float(np.ptp(valid[:, 1])) + 1e-6)
         self._aspect_history[track_id].append(cur_ar)
         
-        result = self._detect_sudden_fall(track_id, h)
+        result = self._detect_sudden_fall(track_id, h, hip_y)
         if result['detected']:
             self._start_cooldown(track_id, result)
             return result
@@ -128,21 +131,24 @@ class StrokeRecognizerV2:
         return self._result(False, 0.0, 'Normal', 'low')
     
     
-    def _detect_sudden_fall(self, track_id: int, frame_height: float) -> dict:
+    def _detect_sudden_fall(self, track_id: int, frame_height: float, hip_y: float) -> dict:
         vel_buf = self._vel_history[track_id]
         if not vel_buf:
             return self._result(False, 0.0, 'Normal', 'low')
         
         max_vel = float(max(vel_buf))
+        fall_distance = sum(v for v in vel_buf if v > 0)
+        
         threshold = self.config.sudden_vel_ratio * frame_height
+        dist_threshold = 0.15 * frame_height
         
         if self.debug:
             logger.debug(
                 f"[Track {track_id}] Sudden Fall Check: "
-                f"max_vel={max_vel:.1f}, threshold={threshold:.1f}"
+                f"max_vel={max_vel:.1f}, fall_dist={fall_distance:.1f}, threshold={threshold:.1f}, hip_y={hip_y:.1f}"
             )
         
-        if max_vel > threshold:
+        if max_vel > threshold and fall_distance > dist_threshold and hip_y > frame_height * 0.4:
             if self.debug:
                 logger.info(f"[Track {track_id}] ✅ SUDDEN FALL DETECTED!")
             # KHÔNG gọi _reset() ở đây — cooldown sẽ giữ trạng thái ổn định
@@ -163,8 +169,9 @@ class StrokeRecognizerV2:
         bbox_h = float(np.ptp(valid[:, 1]))
         aspect = bbox_w / (bbox_h + 1e-6)
         
+        # Yêu cầu bẹt hơn (> 1.5) thay vì 1.2 để chống báo giả khi ngồi
         cond_horizontal = (
-            aspect > self.config.aspect_ratio_min and 
+            aspect > max(1.5, self.config.aspect_ratio_min) and 
             bbox_h < self.config.bbox_h_max_ratio * frame_height
         )
         if not cond_horizontal:
@@ -183,11 +190,13 @@ class StrokeRecognizerV2:
         if l_hip[2] > self.config.kpts_conf_min and r_hip[2] > self.config.kpts_conf_min:
             hip_y = (l_hip[1] + r_hip[1]) / 2
             
-            if nose[2] > self.config.kpts_conf_min:
-                cond_head_low = nose[1] > (hip_y - self.config.head_hip_margin * frame_height)
-            elif l_sho[2] > self.config.kpts_conf_min and r_sho[2] > self.config.kpts_conf_min:
-                sho_y = (l_sho[1] + r_sho[1]) / 2
-                cond_head_low = sho_y > (hip_y - self.config.head_hip_margin * frame_height)
+            # Phải nằm thấp dưới màn hình thì mới tính là bất thường
+            if hip_y > frame_height * 0.4:
+                if nose[2] > self.config.kpts_conf_min:
+                    cond_head_low = nose[1] > (hip_y - self.config.head_hip_margin * frame_height)
+                elif l_sho[2] > self.config.kpts_conf_min and r_sho[2] > self.config.kpts_conf_min:
+                    sho_y = (l_sho[1] + r_sho[1]) / 2
+                    cond_head_low = sho_y > (hip_y - self.config.head_hip_margin * frame_height)
         
         cond_trend = False
         if len(history) >= 3:

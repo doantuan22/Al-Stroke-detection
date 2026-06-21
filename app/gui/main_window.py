@@ -973,10 +973,15 @@ class StrokeApp(ctk.CTk):
                     self.config.get("baggage", {}).get("class_ids", [24, 26, 28])
                     + self.config.get("weapon", {}).get("coco_class_ids", [43, 76])
                 )
+                obj_prefilter_conf = min(
+                    float(self.config.get("inference", {}).get("object_prefilter_confidence", 0.30)),
+                    float(self.config.get("baggage", {}).get("confidence_threshold", 0.45)),
+                    float(self.config.get("weapon", {}).get("confidence_threshold", 0.45)),
+                )
                 obj_results, obj_ran = self.engine.track_objects(
                     frame,
                     classes=object_classes,
-                    conf=float(self.config.get("baggage", {}).get("confidence_threshold", 0.22)),
+                    conf=obj_prefilter_conf,
                 )
 
                 if obj_ran:
@@ -1013,7 +1018,7 @@ class StrokeApp(ctk.CTk):
                 weapon_alerts = []
                 if obj_ran:
                     baggage_alerts, weapon_alerts = self.engine.detect_airport_events(
-                        obj_results, results, camera_id=self.camera_id)
+                        obj_results, results, camera_id=self.camera_id, frame=frame)
                     for alert in baggage_alerts:
                         self._airport_alerts += 1
                         self.after(0, lambda a=alert:
@@ -1034,7 +1039,7 @@ class StrokeApp(ctk.CTk):
 
                 else:
                     self.engine.refresh_weapon_overlays(
-                        self._last_obj_results, results, camera_id=self.camera_id)
+                        self._last_obj_results, results, camera_id=self.camera_id, frame=frame)
 
                     self._db_sync_counter += 1
                     if self._db_sync_counter >= self.DB_SYNC_EVERY:

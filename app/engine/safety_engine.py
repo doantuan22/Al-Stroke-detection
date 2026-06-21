@@ -32,6 +32,7 @@ class SafetyEngine:
         self.config = config
         inf = config.get("inference", {})
         tracking = config.get("tracking", {})
+        person = config.get("person", {})
         stroke = config.get("stroke", {})
         baggage = config.get("baggage", {})
         weapon = config.get("weapon", {})
@@ -41,6 +42,9 @@ class SafetyEngine:
             input_size=int(inf.get("pose_input_size", 768)),
             tracker_cfg=tracker_cfg,
         )
+        self.person_min_conf = float(person.get("min_confidence", 0.55))
+        self.person_min_valid_kpts = int(person.get("min_valid_keypoints", 6))
+        self.person_min_bbox_height = float(person.get("min_bbox_height_px", 48))
         self.tracker = Tracker(max_history=int(tracking.get("max_history", 30)))
         self.recognizer = StrokeRecognizerV2(
             config=StrokeConfig(
@@ -85,13 +89,38 @@ class SafetyEngine:
             config=config,
         )
 
+        weapon_model_path = weapon.get("model_path", "models/weapon_yolo.pt")
+        weapon_model_abs = _resolve_project_path(weapon_model_path)
+        
+        if Path(weapon_model_abs).exists():
+            print(f"[SafetyEngine] Loading dedicated weapon model: {weapon_model_abs}")
+            weapon_od = ObjectDetector(
+                model_path=weapon_model_abs,
+                input_size=int(weapon.get("weapon_input_size", 640)), # Fix: dùng 640 để tránh méo ảnh và tăng tốc
+                object_skip=1,  # Weapon model chạy độc lập không nên skip
+            )
+            use_finetune = True
+            self.weapon_od_independent = True
+        else:
+            weapon_od = self.obj_detector
+            use_finetune = False
+            self.weapon_od_independent = False
+
         self.weapon_detector = WeaponDetector(
-            self.obj_detector,
-            conf=float(weapon.get("confidence_threshold", 0.15)),
+            weapon_od,
+            use_finetune=use_finetune,
+            conf=float(weapon.get("confidence_threshold", 0.45)),
             bearer_radius=float(weapon.get("bearer_radius_px", 200)),
             cooldown=float(weapon.get("cooldown_sec", 5.0)),
-            wrist_distance_threshold=float(weapon.get("wrist_distance_threshold", 80)),
+            wrist_distance_threshold=float(weapon.get("wrist_distance_threshold", 100)),
             pose_confidence_boost=float(weapon.get("pose_confidence_boost", 0.15)),
+            min_pose_associated_conf=float(weapon.get("min_pose_associated_confidence", 0.55)),
+            min_unassociated_conf=float(weapon.get("min_unassociated_confidence", 0.85)),
+            require_pose_association=bool(weapon.get("require_pose_association", False)),
+            min_persistence_sec=float(weapon.get("min_persistence_sec", 1.0)),
+            strict_pose_classes=weapon.get("strict_pose_classes", ["gun", "pistol", "rifle"]),
+            class_confidence_thresholds=weapon.get("class_confidence_thresholds", {}),
+            class_area_ratio_limits=weapon.get("class_area_ratio_limits", {}),
         )
 
         self._last_person_results: dict[int, dict] = {}
@@ -104,8 +133,34 @@ class SafetyEngine:
 
     def track_persons(self, frame, run_inference: bool, cached_results: list[dict]) -> list[dict]:
         if run_inference:
-            return self.detector.track(frame)
+            return self._filter_person_results(
+                self.detector.track(frame, conf=self.person_min_conf)
+            )
         return cached_results
+
+    def _filter_person_results(self, results: list[dict]) -> list[dict]:
+        filtered = []
+        kpts_conf_min = float(self.config.get("stroke", {}).get("kpts_conf_min", 0.25))
+        for res in results:
+            if float(res.get("conf", 0.0)) < self.person_min_conf:
+                continue
+
+            bbox = res.get("bbox") or []
+            if len(bbox) < 4 or (bbox[3] - bbox[1]) < self.person_min_bbox_height:
+                continue
+
+            kpts = res.get("kpts")
+            if kpts is None:
+                continue
+            valid = (
+                (kpts[:, 2] > kpts_conf_min)
+                & (kpts[:, 0] > 0)
+                & (kpts[:, 1] > 0)
+            )
+            if int(valid.sum()) < self.person_min_valid_kpts:
+                continue
+            filtered.append(res)
+        return filtered
 
     def analyze_persons(self, results: list[dict], frame_shape, run_inference: bool):
         active_ids = []
@@ -149,11 +204,15 @@ class SafetyEngine:
         obj_results: list[dict],
         persons: list[dict],
         camera_id: str,
+        frame: Any = None,
         zone_name: str | None = None,
     ) -> tuple[list[dict], list[dict]]:
         baggage_alerts = self.baggage_tracker.update(obj_results, persons, zone_name=zone_name)
+        
+        weapon_input = frame if (self.weapon_od_independent and frame is not None) else obj_results
+        
         weapon_alerts = self.weapon_detector.detect_frame(
-            obj_results, persons, zone_name=zone_name, camera_id=camera_id
+            weapon_input, persons, coco_objects=obj_results, zone_name=zone_name, camera_id=camera_id
         )
         weapon_bearers = {
             a.get("bearer_id") for a in weapon_alerts
@@ -162,6 +221,8 @@ class SafetyEngine:
         self.person_profiles.mark_proximity(weapon_bearers=weapon_bearers)
         return baggage_alerts, weapon_alerts
 
-    def refresh_weapon_overlays(self, obj_results: list[dict], persons: list[dict], camera_id: str):
-        self.weapon_detector.detect_frame(obj_results, persons, camera_id=camera_id)
+    def refresh_weapon_overlays(self, obj_results: list[dict], persons: list[dict], camera_id: str, frame: Any = None):
+        # KHÔNG CHẠY INFERENCE ở frame skip. Weapon Detector lưu lại trạng thái (persistent)
+        # thông qua get_active_overlays() bên ngoài.
+        pass
 

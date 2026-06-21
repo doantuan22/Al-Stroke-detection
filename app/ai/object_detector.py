@@ -162,7 +162,7 @@ class ObjectDetector:
         boxes = results[0].boxes.cpu()
         for i in range(len(boxes)):
             cid = int(boxes.cls[i].item())
-            tid = i   # fallback
+            tid = None   # Không lấy bừa index làm ID nữa
             if use_track_id and boxes.id is not None:
                 tid = int(boxes.id[i].item())
 

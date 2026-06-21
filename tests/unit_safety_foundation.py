@@ -121,6 +121,43 @@ def test_baggage_stationary_and_owner_association():
     assert alerts[0]["stationary"]
 
 
+def test_baggage_low_confidence_false_positive_ignored():
+    tracker = AbandonedBaggageTracker(
+        config={
+            "baggage": {
+                "confidence_threshold": 0.65,
+                "class_confidence_thresholds": {"backpack": 0.68},
+            }
+        },
+    )
+    clothing_like_backpack = make_bag(track_id=12, conf=0.50)
+
+    alerts = tracker.update([clothing_like_backpack], [])
+
+    assert alerts == []
+    assert tracker.get_all_states() == {}
+
+
+def test_baggage_moderate_confidence_is_tracked():
+    tracker = AbandonedBaggageTracker(
+        config={
+            "baggage": {
+                "confidence_threshold": 0.45,
+                "class_confidence_thresholds": {"backpack": 0.50},
+                "min_confirmed_frames": 2,
+                "min_confirmed_seen_sec": 0.0,
+            }
+        },
+    )
+    bag = make_bag(track_id=13, conf=0.55)
+
+    tracker.update([bag], [])
+    alerts = tracker.update([bag], [])
+
+    assert 13 in tracker.get_all_states()
+    assert alerts == []
+
+
 def test_weapon_pose_association_boosts_confidence():
     weapon = {
         "track_id": 1,
@@ -146,3 +183,47 @@ def test_weapon_pose_association_boosts_confidence():
     assert alerts[0]["pose_associated"]
     assert alerts[0]["confidence"] == 0.80
 
+
+def test_weapon_rejects_unassociated_false_positive_when_required():
+    cup_like_weapon = {
+        "track_id": 1,
+        "class_id": 43,
+        "class_name": "knife",
+        "bbox": [300, 230, 320, 260],
+        "conf": 0.70,
+    }
+
+    detector = WeaponDetector(
+        object_detector=None,
+        conf=0.45,
+        require_pose_association=True,
+        min_persistence_sec=0.0,
+    )
+    alerts = detector.detect_frame([cup_like_weapon], [])
+
+    assert alerts == []
+
+
+def test_weapon_rejects_person_sized_false_positive_even_with_pose():
+    weapon = {
+        "track_id": 1,
+        "class_id": 0,
+        "class_name": "gun",
+        "bbox": [260, 160, 380, 360],
+        "conf": 0.92,
+    }
+    person = make_person(track_id=9, cx=320, cy=260)
+    person["bbox"] = [250, 120, 390, 380]
+    person["kpts"][9] = [330, 255, 0.9]
+
+    detector = WeaponDetector(
+        object_detector=None,
+        conf=0.45,
+        min_persistence_sec=0.0,
+        strict_pose_classes=["gun", "pistol", "rifle"],
+        class_confidence_thresholds={"gun": 0.78},
+        class_area_ratio_limits={"gun": 0.18},
+    )
+    alerts = detector.detect_frame([weapon], [person])
+
+    assert alerts == []

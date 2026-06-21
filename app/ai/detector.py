@@ -45,7 +45,7 @@ class PoseDetector:
     # ──────────────────────────────────────────────────────────
     # PREDICT mode (không tracking) — dùng khi chỉ cần keypoints
     # ──────────────────────────────────────────────────────────
-    def detect(self, frame, conf=0.25):
+    def detect(self, frame, conf=0.50):
         """
         Detect persons and poses in a single pass (no tracking).
         conf mặc định 0.25 (thay vì 0.4) để không bỏ sót người
@@ -57,6 +57,7 @@ class PoseDetector:
             imgsz=self.input_size,
             conf=conf,
             half=self.use_half,
+            classes=[0],
             verbose=False,
             device=self.device,
         )
@@ -65,7 +66,7 @@ class PoseDetector:
     # ──────────────────────────────────────────────────────────
     # TRACK mode — dùng ByteTrack, trả track_id ổn định
     # ──────────────────────────────────────────────────────────
-    def track(self, frame, conf=0.25, persist=True):
+    def track(self, frame, conf=0.50, persist=True):
         """
         Detect + track using built-in ByteTrack.
         conf mặc định 0.25 để bắt người có độ tương phản thấp.
@@ -77,6 +78,7 @@ class PoseDetector:
             imgsz=self.input_size,
             conf=conf,
             half=self.use_half,
+            classes=[0],
             persist=persist,         # giữ state tracker giữa các frame
             tracker=self.tracker_cfg,
             verbose=False,
