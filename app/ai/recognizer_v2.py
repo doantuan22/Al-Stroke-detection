@@ -7,6 +7,7 @@ Phát hiện đột quỵ và té ngã với 3 detectors:
   3. Gradual Collapse - Suy sụp từ từ
 """
 import numpy as np
+import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Optional
@@ -35,10 +36,6 @@ class StrokeConfig:
     slump_sustained: int = 5
 
 
-# Số frame giữ trạng thái detected=True sau khi phát hiện (tránh flicker)
-_DETECT_COOLDOWN_FRAMES = 150
-
-
 class StrokeRecognizerV2:
     
     def __init__(self, config: Optional[StrokeConfig] = None, debug: bool = False):
@@ -50,12 +47,11 @@ class StrokeRecognizerV2:
         self._vel_history: dict[int, deque] = {}
         self._aspect_history: dict[int, deque] = {}
         
-        # Cooldown per track: số frame còn lại trong trạng thái "đang bị đột quỵ"
-        # Khi > 0: analyze() trả về detected=True ngay lập tức mà không cần tính lại
-        # Mỗi người (track_id) có cooldown độc lập → không ảnh hưởng lẫn nhau
-        self._detect_cooldown: dict[int, int] = {}
-        # Cache kết quả cuối để trả về trong thời gian cooldown
-        self._last_detect_result: dict[int, dict] = {}
+        # Trạng thái nghi ngờ và xác nhận cảnh báo
+        self._suspect_start_time: dict[int, float] = {}
+        self._confirmed: dict[int, bool] = {}
+        self._symptom: dict[int, str] = {}
+        self.CONFIRM_TIME_SEC = 5.0  # Duy trì 5 giây mới gửi lên database
         
         if self.debug:
             logger.setLevel(logging.DEBUG)
@@ -81,12 +77,18 @@ class StrokeRecognizerV2:
         )
         valid = latest[valid_mask]
         
-        cooldown = self._detect_cooldown.get(track_id, 0)
+        is_suspected = track_id in self._suspect_start_time
         
         if len(valid) < self.config.min_valid_kpts:
-            if cooldown > 0:
-                self._detect_cooldown[track_id] = cooldown - 1
-                return self._last_detect_result.get(track_id, self._result(True, 0.85, 'Detected', 'high'))
+            if is_suspected:
+                # Vẫn giữ trạng thái nghi ngờ nếu mất keypoints tạm thời
+                elapsed = time.time() - self._suspect_start_time[track_id]
+                symptom = self._symptom.get(track_id, 'Unknown')
+                if elapsed >= self.CONFIRM_TIME_SEC:
+                    self._confirmed[track_id] = True
+                    return self._result(True, 0.85, symptom, 'high')
+                return self._result(True, 0.50, symptom + ' (Suspecting...)', 'medium')
+                
             if self.debug:
                 logger.debug(f"[Track {track_id}] Insufficient valid keypoints: {len(valid)}")
             self._clear_state(track_id)
@@ -98,16 +100,26 @@ class StrokeRecognizerV2:
         
         cur_ar = float(np.ptp(valid[:, 0])) / (float(np.ptp(valid[:, 1])) + 1e-6)
         
-        # Recovery check: nếu đang báo động mà đứng lên hoặc hông di chuyển lên nhanh -> hủy báo động
-        if cooldown > 0:
+        # Recovery check: Cử động mạnh thì mới thoát cảnh báo
+        if is_suspected:
             vel_up = prev_hip_y - hip_y
-            if cur_ar < 1.0 or vel_up > 0.05 * h:
+            # Yêu cầu người đó đứng thẳng lên (aspect < 0.8) hoặc bật dậy rất nhanh (vel_up > 0.08 * h)
+            if cur_ar < 0.8 or vel_up > 0.08 * h:
                 if self.debug:
-                    logger.info(f"[Track {track_id}] 🔄 Recovery detected. Canceling alert.")
-                self._detect_cooldown[track_id] = 0
+                    logger.info(f"[Track {track_id}] 🔄 Recovery detected (Strong movement). Canceling alert.")
+                self._suspect_start_time.pop(track_id, None)
+                self._confirmed[track_id] = False
+                self._symptom.pop(track_id, None)
             else:
-                self._detect_cooldown[track_id] = cooldown - 1
-                return self._last_detect_result.get(track_id, self._result(True, 0.85, 'Detected', 'high'))
+                elapsed = time.time() - self._suspect_start_time[track_id]
+                if elapsed >= self.CONFIRM_TIME_SEC:
+                    self._confirmed[track_id] = True
+                
+                symptom = self._symptom.get(track_id, 'Unknown')
+                if self._confirmed[track_id]:
+                    return self._result(True, 0.85, symptom, 'high')
+                else:
+                    return self._result(True, 0.50, symptom + ' (Suspecting...)', 'medium')
         
         # Chỉ thêm giá trị CUỐI vào buffer (tránh thêm trùng các frame cũ)
         self._vel_history[track_id].append(float(hip_y - prev_hip_y))
@@ -115,18 +127,15 @@ class StrokeRecognizerV2:
         
         result = self._detect_sudden_fall(track_id, h, hip_y)
         if result['detected']:
-            self._start_cooldown(track_id, result)
-            return result
+            return self._start_suspected(track_id, result)
         
         result = self._detect_abnormal_posture(track_id, history, latest, valid, h)
         if result['detected']:
-            self._start_cooldown(track_id, result)
-            return result
+            return self._start_suspected(track_id, result)
         
         result = self._detect_gradual_collapse(track_id, h)
         if result['detected']:
-            self._start_cooldown(track_id, result)
-            return result
+            return self._start_suspected(track_id, result)
         
         return self._result(False, 0.0, 'Normal', 'low')
     
@@ -293,18 +302,18 @@ class StrokeRecognizerV2:
         return self._result(False, 0.0, 'Normal', 'low')
     
     
-    def _start_cooldown(self, track_id: int, result: dict):
-        """Bắt đầu cooldown sau khi phát hiện đột quỵ.
+    def _start_suspected(self, track_id: int, result: dict):
+        """Bắt đầu trạng thái nghi ngờ sau khi phát hiện dấu hiệu ngã.
         
-        Trong thời gian cooldown, analyze() trả về cached result mà không
-        tính lại — giúp loại bỏ flicker khi có nhiều người trong khung hình.
-        Buffer được GIỮ NGUYÊN (không xóa) để khi cooldown hết, detector
-        vẫn còn đủ dữ liệu để tiếp tục nhận diện.
+        Trạng thái này được duy trì trong CONFIRM_TIME_SEC (5 giây).
+        Chỉ khi qua 5 giây mới đổi risk_level thành 'high' để gửi DB.
         """
-        self._detect_cooldown[track_id] = _DETECT_COOLDOWN_FRAMES
-        self._last_detect_result[track_id] = result
+        self._suspect_start_time[track_id] = time.time()
+        self._confirmed[track_id] = False
+        self._symptom[track_id] = result['symptom']
         if self.debug:
-            logger.info(f"[Track {track_id}] 🔒 Cooldown started ({_DETECT_COOLDOWN_FRAMES} frames)")
+            logger.info(f"[Track {track_id}] 🔒 Suspected state started. Waiting 5s to confirm.")
+        return self._result(True, 0.50, result['symptom'] + ' (Suspecting...)', 'medium')
 
     def _clear_state(self, track_id: int):
         """Xóa toàn bộ state khi track biến mất (history < 5 frames).
@@ -314,8 +323,9 @@ class StrokeRecognizerV2:
         """
         self._sustained_posture[track_id] = 0
         self._sustained_slump[track_id] = 0
-        self._detect_cooldown[track_id] = 0
-        self._last_detect_result.pop(track_id, None)
+        self._suspect_start_time.pop(track_id, None)
+        self._confirmed[track_id] = False
+        self._symptom.pop(track_id, None)
         if track_id in self._vel_history:
             self._vel_history[track_id].clear()
         if track_id in self._aspect_history:

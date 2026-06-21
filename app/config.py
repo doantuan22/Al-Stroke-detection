@@ -51,7 +51,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "evidence_frames_before": 5,
         "evidence_frames_after": 5,
         "max_stroke_uploads_per_track": 3,
-        "stroke_upload_every_nth_alert": 2,
+        "stroke_upload_every_nth_alert": 1,
         "stroke_track_cooldown_sec": 5.0,
         "severity": {
             "observing": 0.4,
@@ -62,7 +62,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "stroke": {
         "cooldown_sec": 15.0,
         "suspected_duration_sec": 1.0,
-        "confirmed_duration_sec": 2.0,
+        "confirmed_duration_sec": 5.0,
+        "recovery_motion_ratio": 0.08,
+        "recovery_streak_frames": 2,
+        "recovery_gap_sec": 1.0,
         "kpts_conf_min": 0.25,
         "min_valid_kpts": 5,
         "sudden_vel_ratio": 0.07,

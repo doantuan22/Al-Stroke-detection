@@ -79,7 +79,7 @@ def test_stroke_detection_streaming_sudden_fall():
     result = feed_stream(recognizer, frames, track_id=42)
 
     assert result["detected"]
-    assert result["symptom"] == "Sudden_Fall"
+    assert result["symptom"] == "Sudden_Fall (Suspecting...)"
 
 
 def test_stroke_detection_streaming_normal_no_false_positive():
