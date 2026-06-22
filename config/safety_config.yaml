@@ -99,22 +99,22 @@ weapon:
   fallback_to_coco: true
   confidence_threshold: 0.45
   min_pose_associated_confidence: 0.55
-  min_unassociated_confidence: 0.85
+  min_unassociated_confidence: 0.70
   require_pose_association: false
   strict_pose_classes: [gun, pistol, rifle]
   class_confidence_thresholds:
     gun: 0.78
     pistol: 0.72
     rifle: 0.76
-    knife: 0.45
-    scissors: 0.50
+    knife: 0.75
+    scissors: 0.75
   class_area_ratio_limits:
     gun: 0.18
     pistol: 0.15
     rifle: 0.22
-    knife: 0.35
-    scissors: 0.30
-  min_persistence_sec: 1.0
+    knife: 1.50
+    scissors: 1.00
+  min_persistence_sec: 5.0
   bearer_radius_px: 200
   wrist_distance_threshold: 100
   pose_confidence_boost: 0.15

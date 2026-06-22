@@ -21,7 +21,7 @@ def make_standing_pose(y_offset=120, conf=0.9):
     kpts[14] = [330, y_offset + 200, conf]
     kpts[15] = [310, y_offset + 260, conf]
     kpts[16] = [330, y_offset + 260, conf]
-    return kpts
+    return {"kpts": kpts, "bbox": [285, y_offset - 5, 355, y_offset + 260]}
 
 
 def feed_stream(recognizer, frames, track_id=1, img_size=(640, 480)):
@@ -227,3 +227,61 @@ def test_weapon_rejects_person_sized_false_positive_even_with_pose():
     alerts = detector.detect_frame([weapon], [person])
 
     assert alerts == []
+
+
+def test_baggage_shared_ownership():
+    tracker = AbandonedBaggageTracker(
+        config={
+            "baggage": {
+                "owner_confirm_time_sec": 0.2,
+                "proximity_expand_px": 150.0,
+            }
+        },
+    )
+    bag1 = make_bag(track_id=1, cx=250, cy=240)
+    bag2 = make_bag(track_id=2, cx=350, cy=240)
+    person = make_person(track_id=5, cx=300, cy=240)
+    
+    tracker.update([bag1, bag2], [person])
+    time.sleep(0.1)
+    tracker.update([bag1, bag2], [person])
+    time.sleep(0.1)
+    tracker.update([bag1, bag2], [person])
+    time.sleep(0.1)
+    tracker.update([bag1, bag2], [person])
+    
+    states = tracker.get_all_states()
+    assert states[1].likely_owner_id == 5
+    assert states[2].likely_owner_id == 5
+    assert states[1].owner_gone_at is None
+    assert states[2].owner_gone_at is None
+
+
+def test_baggage_ignore_passerby():
+    tracker = AbandonedBaggageTracker(
+        config={
+            "baggage": {
+                "owner_confirm_time_sec": 0.5,
+                "proximity_expand_px": 150.0,
+            }
+        },
+    )
+    bag = make_bag(track_id=1, cx=300, cy=240)
+    
+    tracker.update([bag], [])
+    state = tracker.get_all_states()[1]
+    initial_gone_at = state.owner_gone_at
+    assert initial_gone_at is not None
+    
+    time.sleep(0.2)
+    passerby = make_person(track_id=9, cx=320, cy=240)
+    tracker.update([bag], [passerby])
+    time.sleep(0.2)
+    tracker.update([bag], [passerby])
+    
+    time.sleep(0.2)
+    tracker.update([bag], [])
+    
+    state = tracker.get_all_states()[1]
+    assert state.owner_gone_at == initial_gone_at
+    assert state.owner_seen_since is None

@@ -32,7 +32,7 @@ class AirportCloudClient(SupabaseClient):
 
     # Sub-folder trong Storage bucket
     _SUBFOLDERS = {
-        'abandoned_baggage': 'baggage',
+        'abandoned_baggage': 'alerts',
         'weapon_detected'  : 'weapons',
     }
 
@@ -68,31 +68,33 @@ class AirportCloudClient(SupabaseClient):
             filename = f"{etype}_{ts}_{uid}.jpg"
             path     = f"{subfolder}/{filename}"
 
-            # ── 1. Encode + Upload ảnh ───────────────────────────────
-            _, buf = cv2.imencode(
-                '.jpg', frame,
-                [cv2.IMWRITE_JPEG_QUALITY, 85]
-            )
-            # upsert=True → tránh lỗi file đã tồn tại (x-upsert header)
+            url = ""
             try:
-                self.client.storage.from_(self.bucket_name).upload(
-                    path=path,
-                    file=buf.tobytes(),
-                    file_options={
-                        "content-type": "image/jpeg",
-                        "upsert": "true",
-                    },
+                # ── 1. Encode + Upload ảnh ───────────────────────────────
+                _, buf = cv2.imencode(
+                    '.jpg', frame,
+                    [cv2.IMWRITE_JPEG_QUALITY, 85]
                 )
-            except Exception as upload_err:
-                print(f"[AirportCloud] Storage upload warning: {upload_err} — retrying as update...")
-                self.client.storage.from_(self.bucket_name).update(
-                    path=path,
-                    file=buf.tobytes(),
-                    file_options={"content-type": "image/jpeg"},
-                )
-
-            # ── 2. Lấy public URL ───────────────────────────────
-            url = self.client.storage.from_(self.bucket_name).get_public_url(path)
+                try:
+                    self.client.storage.from_(self.bucket_name).upload(
+                        path=path,
+                        file=buf.tobytes(),
+                        file_options={
+                            "content-type": "image/jpeg",
+                            "upsert": "true",
+                        },
+                    )
+                except Exception as upload_err:
+                    print(f"[AirportCloud] Storage upload warning: {upload_err} — retrying as update...")
+                    self.client.storage.from_(self.bucket_name).update(
+                        path=path,
+                        file=buf.tobytes(),
+                        file_options={"content-type": "image/jpeg"},
+                    )
+                # ── 2. Lấy public URL ───────────────────────────────
+                url = self.client.storage.from_(self.bucket_name).get_public_url(path)
+            except Exception as storage_e:
+                print(f"[AirportCloud] WARNING: Image upload failed, proceeding with DB insert only. Error: {storage_e}")
 
             # ── 3. Insert vào airport_events ────────────────
             bbox = alert.get('bbox', [])
@@ -115,7 +117,7 @@ class AirportCloudClient(SupabaseClient):
                 "created_at"  : datetime.now(timezone.utc).isoformat(),
             }
             self.client.table(self.AIRPORT_TABLE).insert(data).execute()
-            print(f"[AirportCloud] OK {etype} uploaded -> {path}")
+            print(f"[AirportCloud] OK {etype} uploaded -> {path if url else 'no_image'}")
             return url, path
 
         except Exception as e:
@@ -151,7 +153,11 @@ class AirportCloudClient(SupabaseClient):
             ).execute()
             return True
         except Exception as e:
-            print(f"[AirportCloud] Baggage upsert failed: {e}")
+            err_str = str(e)
+            if 'row-level security' in err_str:
+                print("[AirportCloud] Baggage realtime sync blocked by RLS.")
+            else:
+                print(f"[AirportCloud] Baggage upsert failed: {e}")
             return False
 
     # ── Fetch airport_events ────────────────────────────────────
@@ -271,4 +277,6 @@ class AirportCloudClient(SupabaseClient):
                 self.client.table(self.BAGGAGE_TABLE)\
                     .delete().eq("track_id", tid).execute()
         except Exception as e:
-            print(f"[AirportCloud] Clean tracks failed: {e}")
+            err_str = str(e)
+            if 'row-level security' not in err_str:
+                print(f"[AirportCloud] Clean tracks failed: {e}")

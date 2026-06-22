@@ -149,6 +149,20 @@ class WeaponDetector:
                 conf=self.conf,
             )
 
+        # ── TÍCH HỢP COCO WEAPON (KNIFE = 43) ──
+        # Model YOLO tự train nhận diện dao rất kém, trong khi COCO nhận diện dao (43) rất tốt.
+        # Chúng ta sẽ hợp nhất kết quả của COCO vào danh sách vũ khí.
+        if coco_objects:
+            knife_cid = next((k for k, v in self.weapon_classes.items() if v == 'knife'), None)
+            if knife_cid is not None:
+                for co in coco_objects:
+                    if co.get('class_id') == 43 and co.get('conf', 0) >= self.conf:
+                        all_objects.append({
+                            'class_id': knife_cid,
+                            'bbox': co['bbox'],
+                            'conf': co['conf']
+                        })
+
         alerts = []
         now    = time.time()
         seen_keys: set[str] = set()
@@ -163,17 +177,18 @@ class WeaponDetector:
             conf_val   = obj['conf']
 
             # ── ENSEMBLE FILTERING (Chống Ảo Giác Model Yếu) ──
-            # Nếu model weapon_yolo.pt nhận nhầm bình nước/cái ghế thành súng,
-            # nhưng model COCO chuẩn báo đó là bình nước, ta sẽ tin COCO và hủy bỏ!
             if coco_objects and self.use_finetune:
                 is_harmless = False
-                # 39: bottle, 41: cup, 56: chair, 57: couch, 63: laptop, 64: mouse, 67: cell phone, 73: book
-                harmless_classes = {39, 41, 56, 57, 63, 64, 67, 73, 74}
+                # Mở rộng danh sách vật dụng có thể cầm tay hoặc gây nhầm lẫn:
+                harmless_classes = {
+                    24, 25, 26, 27, 28, 39, 41, 42, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55,
+                    56, 57, 63, 64, 65, 66, 67, 73, 74, 75, 76, 77, 78, 79
+                }
                 for co in coco_objects:
                     cid_coco = co.get('class_id')
                     if cid_coco in harmless_classes:
                         c_bbox = co['bbox']
-                        # Tính IoU (Intersection over Union)
+                        # Tính Intersection over Minimum Area (IoMin)
                         xA = max(bbox[0], c_bbox[0])
                         yA = max(bbox[1], c_bbox[1])
                         xB = min(bbox[2], c_bbox[2])
@@ -182,39 +197,42 @@ class WeaponDetector:
                         if interArea > 0:
                             boxAArea = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
                             boxBArea = (c_bbox[2] - c_bbox[0]) * (c_bbox[3] - c_bbox[1])
-                            iou = interArea / float(boxAArea + boxBArea - interArea + 1e-5)
-                            # Nếu vũ khí chồng chéo hơn 30% với bình nước/điện thoại/ghế -> ẢO GIÁC!
-                            if iou > 0.3:
-                                is_harmless = True
-                                break
+                            minArea = min(boxAArea, boxBArea)
+                            if minArea > 0:
+                                iomin = interArea / float(minArea)
+                                # Nếu diện tích giao nhau chiếm > 40% của box nhỏ hơn -> Ảo giác!
+                                if iomin > 0.4:
+                                    is_harmless = True
+                                    break
                 if is_harmless:
-                    continue  # Bỏ qua false positive ngớ ngẩn này
+                    continue
 
             cx = (bbox[0] + bbox[2]) / 2
             cy = (bbox[1] + bbox[3]) / 2
 
-            # KHÔNG DÙNG track_id CHO loc_key! YOLO ByteTrack ở 15fps rất dễ bị đổi ID liên tục.
-            # Nếu đổi ID, nó sẽ tạo loc_key mới và lọt qua cooldown gây bão spam cảnh báo.
-            # Dùng spatial matching (150px) là ổn định nhất để chặn bão spam.
-            matched_key = None
-            for key, det in self._active_detections.items():
-                if det['class_name'] == class_name:
-                    dbbox = det['bbox']
-                    dcx = (dbbox[0] + dbbox[2]) / 2
-                    dcy = (dbbox[1] + dbbox[3]) / 2
-                    if (cx - dcx)**2 + (cy - dcy)**2 < 150**2:
-                        matched_key = key
-                        break
-            
-            if matched_key:
-                loc_key = matched_key
+            # Xác định bearer (người đang cầm) TRƯỚC ĐỂ LÀM KEY KHÓA MỤC TIÊU!
+            bearer_id, hand_distance, pose_associated, bearer_bbox = self._find_bearer_details(cx, cy, persons)
+
+            if bearer_id is not None:
+                # Khóa mục tiêu theo người đang cầm (Bearer Tracking)
+                loc_key = f"weapon_{class_name}_bearer_{bearer_id}"
             else:
-                loc_key = f"{class_name}_{int(cx)}_{int(cy)}"
+                # Nếu không có người cầm, dùng spatial tracking tĩnh
+                matched_key = None
+                for key, det in self._active_detections.items():
+                    if det['class_name'] == class_name and det['bearer_id'] is None:
+                        dbbox = det['bbox']
+                        dcx = (dbbox[0] + dbbox[2]) / 2
+                        dcy = (dbbox[1] + dbbox[3]) / 2
+                        if (cx - dcx)**2 + (cy - dcy)**2 < 150**2:
+                            matched_key = key
+                            break
+                if matched_key:
+                    loc_key = matched_key
+                else:
+                    loc_key = f"{class_name}_static_{int(cx)}_{int(cy)}"
                     
             seen_keys.add(loc_key)
-
-            # Xác định bearer (người đang cầm)
-            bearer_id, hand_distance, pose_associated, bearer_bbox = self._find_bearer_details(cx, cy, persons)
             
             # ── BẢO VỆ KÉP (DUAL THRESHOLD) ──
             if class_name in self.strict_pose_classes and not pose_associated:
@@ -383,7 +401,8 @@ class WeaponDetector:
             return None, False
 
         best = float('inf')
-        for idx in (7, 8, 9, 10):
+        # Bổ sung khớp vai (5,6) và hông (11,12) ngoài khuỷu tay/cổ tay
+        for idx in (5, 6, 7, 8, 9, 10, 11, 12):
             if len(kpts) <= idx:
                 continue
             kp = kpts[idx]
@@ -393,7 +412,17 @@ class WeaponDetector:
 
         if best == float('inf'):
             return None, False
-        return best, best <= self.wrist_distance_threshold
+            
+        # Tính ngưỡng linh hoạt dựa trên chiều rộng cơ thể người
+        pb = person.get('bbox')
+        if pb and len(pb) >= 4:
+            pw = float(pb[2] - pb[0])
+            # Giới hạn ngưỡng từ 30px đến wrist_distance_threshold
+            dynamic_threshold = max(30.0, min(self.wrist_distance_threshold, pw * 0.6))
+        else:
+            dynamic_threshold = self.wrist_distance_threshold
+            
+        return best, best <= dynamic_threshold
 
     def _class_min_conf(self, class_name: str, pose_associated: bool) -> float:
         name = str(class_name).lower()
@@ -428,7 +457,8 @@ class WeaponDetector:
                 return False
 
             if name in {"gun", "pistol", "rifle"}:
-                if w > pw * 0.7 or h > ph * 0.55:
+                # Súng trường có thể vắt ngang nên chiều rộng có thể gấp đôi người
+                if w > pw * 2.5 or h > ph * 0.8:
                     return False
 
         return True

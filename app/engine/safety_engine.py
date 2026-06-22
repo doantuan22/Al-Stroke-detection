@@ -175,7 +175,7 @@ class SafetyEngine:
             if run_inference:
                 kpts = self.smoother.smooth(track_id, res["kpts"])
                 res["kpts"] = kpts
-                self.tracker.update_history(track_id, kpts)
+                self.tracker.update_history(track_id, res)
                 history = self.tracker.get_history(track_id)
                 result = self.recognizer.analyze(history, (w, h), track_id=track_id)
                 self._last_person_results[track_id] = result

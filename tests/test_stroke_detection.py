@@ -69,7 +69,7 @@ def make_standing_pose(y_offset=120, conf=0.9):
     kpts[14] = [330, y_offset + 200, conf]
     kpts[15] = [310, y_offset + 260, conf]
     kpts[16] = [330, y_offset + 260, conf]
-    return kpts
+    return {"kpts": kpts, "bbox": [285, y_offset - 5, 355, y_offset + 260]}
 
 
 def make_lying_pose(conf=0.9):
@@ -96,7 +96,7 @@ def make_lying_pose(conf=0.9):
     }
     for idx, (x, y) in points.items():
         kpts[idx] = [x, y, conf]
-    return kpts
+    return {"kpts": kpts, "bbox": [185, base_y - 5, 600, base_y + 25]}
 
 
 def feed_stream(recognizer, frames, track_id=1):
@@ -121,7 +121,7 @@ def test_sudden_fall():
     frames.append(make_standing_pose(250))
     result = feed_stream(recognizer, frames, track_id=1)
     check("detected", result["detected"], str(result))
-    check("symptom", result["symptom"] == "Sudden_Fall", result["symptom"])
+    check("symptom", result["symptom"] == "Sudden_Fall (Suspecting...)", result["symptom"])
 
 
 def test_abnormal_posture():
@@ -135,7 +135,7 @@ def test_abnormal_posture():
         if result["detected"]:
             break
     check("detected", result["detected"], str(result))
-    check("symptom", result["symptom"] == "Abnormal_Posture", result["symptom"])
+    check("symptom", result["symptom"] == "Abnormal_Posture (Suspecting...)", result["symptom"])
 
 
 def test_normal_activity():
@@ -155,7 +155,7 @@ def make_sitting_bend(conf=0.9):
     kpts[12] = [340, base_y, conf]
     kpts[15] = [300, base_y + 40, conf]
     kpts[16] = [340, base_y + 40, conf]
-    return kpts
+    return {"kpts": kpts, "bbox": [300, base_y, 340, base_y + 40]}
 
 def test_sitting_bend():
     section("Sitting bend (No false positive)")
