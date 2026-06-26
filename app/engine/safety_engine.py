@@ -39,6 +39,7 @@ class SafetyEngine:
 
         tracker_cfg = _resolve_project_path(tracking.get("tracker_config", "bytetrack_stroke.yaml"))
         self.detector = PoseDetector(
+            model_path=inf.get("pose_model", "yolov8m-pose.pt"),
             input_size=int(inf.get("pose_input_size", 768)),
             tracker_cfg=tracker_cfg,
         )
@@ -75,7 +76,7 @@ class SafetyEngine:
         )
 
         self.obj_detector = ObjectDetector(
-            model_path="yolov8n.pt",
+            model_path=inf.get("object_model", "yolov8m.pt"),
             input_size=int(inf.get("object_input_size", 960)),
             object_skip=int(inf.get("object_skip_default", 2)),
         )

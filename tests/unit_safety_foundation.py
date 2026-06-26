@@ -263,6 +263,7 @@ def test_baggage_ignore_passerby():
             "baggage": {
                 "owner_confirm_time_sec": 0.5,
                 "proximity_expand_px": 150.0,
+                "stationary_duration_sec": 0.0,
             }
         },
     )

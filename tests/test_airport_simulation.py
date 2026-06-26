@@ -16,6 +16,11 @@ import sys
 import time
 import numpy as np
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
 # Thêm project root vào path
 sys.path.insert(0, '.')
 
@@ -66,10 +71,14 @@ def make_bag(track_id: int, cx: float, cy: float,
 
 def make_person(track_id: int, cx: float, cy: float) -> dict:
     """Tạo person giả."""
+    kpts = np.zeros((17, 3))
+    # Add fake keypoints for hips (11, 12) with high confidence so it can associate with pose
+    kpts[11] = [cx, cy, 0.9]
+    kpts[12] = [cx, cy, 0.9]
     return {
         'track_id': track_id,
         'bbox'    : [cx - 30, cy - 80, cx + 30, cy + 80],
-        'kpts'    : np.zeros((17, 3)),
+        'kpts'    : kpts,
         'conf'    : 0.90,
     }
 
@@ -431,7 +440,7 @@ obj_results_mock = [
         'class_id'  : 43, # knife
         'class_name': 'knife',
         'bbox'      : knife_obj_opt['bbox'],
-        'conf'      : 0.72
+        'conf'      : 0.95
     }
 ]
 

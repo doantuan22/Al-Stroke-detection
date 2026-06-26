@@ -417,8 +417,8 @@ class WeaponDetector:
         pb = person.get('bbox')
         if pb and len(pb) >= 4:
             pw = float(pb[2] - pb[0])
-            # Giới hạn ngưỡng từ 30px đến wrist_distance_threshold
-            dynamic_threshold = max(30.0, min(self.wrist_distance_threshold, pw * 0.6))
+            # Giới hạn ngưỡng tối thiểu là 30px, nhưng cho phép tỷ lệ thuận với người (không bị hard-cap để xử lý khi người quá gần)
+            dynamic_threshold = max(30.0, pw * 0.6)
         else:
             dynamic_threshold = self.wrist_distance_threshold
             
@@ -453,12 +453,32 @@ class WeaponDetector:
             ph = float(person_bbox[3] - person_bbox[1])
             person_area = max(pw * ph, 1e-6)
             weapon_area = w * h
-            if weapon_area > person_area * ratio_limit:
+            
+            # Điều chỉnh linh hoạt ratio_limit
+            adjusted_ratio = ratio_limit
+            
+            # 1. Người ở quá xa (diện tích nhỏ) -> Nới lỏng giới hạn do YOLO bắt bbox thường lỏng lẻo
+            if person_area < 30000:
+                adjusted_ratio = min(1.0, adjusted_ratio * 2.5)
+                
+            # 2. Người ở quá gần bị cắt mất phần dưới khung hình -> Tỷ lệ width/height sẽ tăng lên
+            # Bình thường người có tỷ lệ pw/ph khoảng 0.3 - 0.5. Nếu > 0.6 tức là bị cắt dọc thân.
+            elif ph > 0 and pw / ph > 0.6:
+                adjusted_ratio = min(1.0, adjusted_ratio * 2.0)
+
+            if weapon_area > person_area * adjusted_ratio:
                 return False
 
             if name in {"gun", "pistol", "rifle"}:
                 # Súng trường có thể vắt ngang nên chiều rộng có thể gấp đôi người
-                if w > pw * 2.5 or h > ph * 0.8:
+                max_w_ratio = 2.5
+                max_h_ratio = 0.8
+                
+                # Nếu người bị cắt, súng có thể cao hơn phần thân còn lại trong khung hình
+                if ph > 0 and pw / ph > 0.6:
+                    max_h_ratio = 1.5
+                    
+                if w > pw * max_w_ratio or h > ph * max_h_ratio:
                     return False
 
         return True

@@ -44,6 +44,7 @@ class StrokeRecognizerV2:
         self._sustained_slump: dict[int, int] = {}
         self._vel_history: dict[int, deque] = {}
         self._aspect_history: dict[int, deque] = {}
+        self._activity_history: dict[int, deque] = {}
         
         # Trạng thái nghi ngờ và xác nhận cảnh báo
         self._suspect_start_time: dict[int, float] = {}
@@ -64,6 +65,7 @@ class StrokeRecognizerV2:
         if track_id not in self._vel_history:
             self._vel_history[track_id] = deque(maxlen=self.config.vel_window)
             self._aspect_history[track_id] = deque(maxlen=self.config.slump_window)
+            self._activity_history[track_id] = deque(maxlen=self.config.vel_window)
         
         latest_dict = history[-1]
         latest_kpts = latest_dict["kpts"]
@@ -100,6 +102,29 @@ class StrokeRecognizerV2:
         bbox_h = max(1.0, latest_bbox[3] - latest_bbox[1])
         cur_ar = float(bbox_w) / float(bbox_h)
         
+        # Tính toán độ cử động của các khớp SO VỚI HÔNG (Relative Joint Movement)
+        # Giúp loại bỏ chuyển động rơi của toàn bộ cơ thể, giữ lại cử động chủ động của tay chân
+        curr_hip_x = (latest_kpts[11, 0] + latest_kpts[12, 0]) / 2
+        curr_hip_y_val = (latest_kpts[11, 1] + latest_kpts[12, 1]) / 2
+        prev_hip_x = (prev_kpts[11, 0] + prev_kpts[12, 0]) / 2
+        prev_hip_y_val = (prev_kpts[11, 1] + prev_kpts[12, 1]) / 2
+
+        rel_joint_movement = 0.0
+        rel_joint_count = 0
+        for i in [7, 8, 9, 10, 13, 14, 15, 16]: # elbows, wrists, knees, ankles
+            if latest_kpts[i, 2] > 0.25 and prev_kpts[i, 2] > 0.25:
+                curr_rel_x = latest_kpts[i, 0] - curr_hip_x
+                curr_rel_y = latest_kpts[i, 1] - curr_hip_y_val
+                prev_rel_x = prev_kpts[i, 0] - prev_hip_x
+                prev_rel_y = prev_kpts[i, 1] - prev_hip_y_val
+                
+                rel_joint_movement += float(np.hypot(curr_rel_x - prev_rel_x, curr_rel_y - prev_rel_y))
+                rel_joint_count += 1
+                
+        avg_rel_joint = (rel_joint_movement / rel_joint_count) if rel_joint_count > 0 else 0.0
+        self._activity_history[track_id].append(avg_rel_joint)
+        recent_activity = sum(self._activity_history[track_id]) / len(self._activity_history[track_id]) if self._activity_history[track_id] else 0.0
+        
         # Recovery check: Khóa cứng mục tiêu
         if is_suspected:
             cx_cur = (latest_bbox[0] + latest_bbox[2]) / 2
@@ -109,11 +134,14 @@ class StrokeRecognizerV2:
             dist_moved = float(np.hypot(cx_cur - cx_prev, cy_cur - cy_prev))
             vel_up = prev_hip_y - hip_y
             
-            # Chỉ thoát cảnh báo nếu đứng lên (ar < 0.8) VÀ có cử động rõ ràng
-            strong_movement = (dist_moved > 0.03 * h) or (vel_up > 0.05 * h)
+            # Cải tiến: thoát cảnh báo nếu đứng lên (ar < 0.8) HOẶC có cử động mạnh các khớp (tay, chân)
             is_standing = cur_ar < 0.8
+            is_moving_up = vel_up > 0.05 * h
+            is_active_limbs = recent_activity > 0.012 * h
             
-            if strong_movement and is_standing:
+            strong_movement = (dist_moved > 0.05 * h) or is_moving_up or is_active_limbs
+            
+            if is_standing or strong_movement:
                 if self.debug:
                     logger.info(f"[Track {track_id}] 🔄 Recovery detected (Strong movement). Canceling alert.")
                 self._suspect_start_time.pop(track_id, None)
@@ -137,7 +165,7 @@ class StrokeRecognizerV2:
         if result['detected']:
             return self._start_suspected(track_id, result)
         
-        result = self._detect_abnormal_posture(track_id, history, latest_kpts, bbox_w, bbox_h, h)
+        result = self._detect_abnormal_posture(track_id, history, latest_kpts, bbox_w, bbox_h, h, recent_activity)
         if result['detected']:
             return self._start_suspected(track_id, result)
         
@@ -178,7 +206,8 @@ class StrokeRecognizerV2:
         latest_kpts: np.ndarray, 
         bbox_w: float,
         bbox_h: float,
-        frame_height: float
+        frame_height: float,
+        recent_activity: float
     ) -> dict:
         aspect = bbox_w / max(1e-6, bbox_h)
         
@@ -218,7 +247,10 @@ class StrokeRecognizerV2:
                 ratios.append(float(pw) / float(ph))
             cond_trend = len(ratios) == 3 and all(r > self.config.aspect_ratio_min for r in ratios)
         
-        is_posture_bad = cond_horizontal and cond_head_low and cond_trend
+        is_active = recent_activity > 0.012 * frame_height
+        
+        # Nếu đang nằm nhưng vẫn cử động khớp liên tục (is_active = True) thì không coi là bất thường
+        is_posture_bad = cond_horizontal and cond_head_low and cond_trend and not is_active
         
         if is_posture_bad:
             cnt = self._sustained_posture.get(track_id, 0) + 1
@@ -281,6 +313,8 @@ class StrokeRecognizerV2:
             self._vel_history[track_id].clear()
         if track_id in self._aspect_history:
             self._aspect_history[track_id].clear()
+        if track_id in self._activity_history:
+            self._activity_history[track_id].clear()
 
     def _reset(self, track_id: int):
         self._clear_state(track_id)

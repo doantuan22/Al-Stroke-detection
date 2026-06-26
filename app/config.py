@@ -23,6 +23,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "buffer_size": 1,
     },
     "inference": {
+        "pose_model": "yolov8m-pose.pt",
+        "object_model": "yolov8m.pt",
         "pose_input_size": 768,
         "object_input_size": 960,
         "object_prefilter_confidence": 0.30,
